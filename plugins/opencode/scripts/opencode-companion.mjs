@@ -13,7 +13,7 @@ import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/pr
 import { isServerRunning, ensureServer, createClient, connect } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath } from "./lib/state.mjs";
-import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob } from "./lib/job-control.mjs";
+import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
@@ -21,6 +21,12 @@ import { getDiff, getStatus as getGitStatus } from "./lib/git.mjs";
 import { readJson } from "./lib/fs.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
+
+// Single source for the loopback daemon URL (was hardcoded at several sites).
+function defaultServerUrl() {
+  const port = Number(process.env.OPENCODE_SERVER_PORT) || 4096;
+  return `http://127.0.0.1:${port}`;
+}
 
 // ------------------------------------------------------------------
 // Subcommand dispatch
@@ -73,7 +79,7 @@ async function handleSetup(argv) {
 
     if (serverRunning) {
       try {
-        const client = createClient("http://127.0.0.1:4096");
+        const client = createClient(defaultServerUrl());
         const providerList = await client.listProviders();
         // /provider returns { all, default, connected }, not a bare array.
         const list = Array.isArray(providerList) ? providerList : (providerList?.all ?? []);
@@ -87,6 +93,11 @@ async function handleSetup(argv) {
   // Handle review gate toggle
   const workspace = await resolveWorkspace();
   let reviewGate = false;
+
+  if (options["enable-review-gate"] && options["disable-review-gate"]) {
+    console.error("Pass only one of --enable-review-gate or --disable-review-gate.");
+    process.exit(1);
+  }
 
   if (options["enable-review-gate"]) {
     updateState(workspace, (state) => {
@@ -260,7 +271,7 @@ async function handleTask(argv) {
     const lastTask = state.jobs
       ?.filter((j) => j.type === "task" && j.opencodeSessionId)
       ?.filter((j) => !sessionId || j.sessionId === sessionId)
-      ?.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))?.[0];
+      ?.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))?.[0];
 
     if (lastTask?.opencodeSessionId) {
       resumeSessionId = lastTask.opencodeSessionId;
@@ -514,7 +525,7 @@ async function handleTaskResumeCandidate(argv) {
     ?.filter((j) => j.type === "task" && j.opencodeSessionId)
     ?.filter((j) => j.status === "completed" || j.status === "running")
     ?.filter((j) => !sessionId || j.sessionId === sessionId)
-    ?.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))?.[0];
+    ?.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))?.[0];
 
   const result = {
     available: !!lastTask,
@@ -535,21 +546,35 @@ async function handleTaskResumeCandidate(argv) {
 
 async function handleStatus(argv) {
   const workspace = await resolveWorkspace();
-  const state = loadState(workspace);
   const sessionId = getClaudeSessionId();
 
-  const snapshot = buildStatusSnapshot(state.jobs ?? [], workspace, { sessionId });
+  // Recover any job whose worker died without writing a terminal status, so a
+  // crashed background task stops showing as a phantom "running" forever.
+  const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
+
+  const snapshot = buildStatusSnapshot(jobs, workspace, { sessionId });
   console.log(renderStatus(snapshot));
+}
+
+// Job references come from slash-command $ARGUMENTS; keep them to a safe
+// id/prefix shape so nothing surprising flows into lookups or output.
+function isSafeJobRef(ref) {
+  return typeof ref === "string" && /^[A-Za-z0-9._:-]+$/.test(ref);
 }
 
 async function handleResult(argv) {
   const { positional } = parseArgs(argv, {});
   const ref = positional[0];
+  if (ref && !isSafeJobRef(ref)) {
+    console.error("Invalid job reference. Use a job ID or safe ID prefix.");
+    process.exit(1);
+  }
 
   const workspace = await resolveWorkspace();
-  const state = loadState(workspace);
+  const sessionId = getClaudeSessionId();
+  const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
 
-  const { job, ambiguous } = resolveResultJob(state.jobs ?? [], ref);
+  const { job, ambiguous } = resolveResultJob(jobs, ref, { sessionId });
 
   if (ambiguous) {
     console.error("Ambiguous job reference. Please provide a more specific ID prefix.");
@@ -557,7 +582,10 @@ async function handleResult(argv) {
   }
 
   if (!job) {
-    console.log("No finished job found.");
+    const anyRunning = jobs.some((j) => j.status === "running" || j.status === "pending");
+    console.log(anyRunning
+      ? "No finished job yet — a job is still running. Try `/opencode:status`."
+      : "No finished job found.");
     return;
   }
 
@@ -573,11 +601,16 @@ async function handleResult(argv) {
 async function handleCancel(argv) {
   const { positional } = parseArgs(argv, {});
   const ref = positional[0];
+  if (ref && !isSafeJobRef(ref)) {
+    console.error("Invalid job reference. Use a job ID or safe ID prefix.");
+    process.exit(1);
+  }
 
   const workspace = await resolveWorkspace();
-  const state = loadState(workspace);
+  const sessionId = getClaudeSessionId();
+  const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
 
-  const { job, ambiguous } = resolveCancelableJob(state.jobs ?? [], ref);
+  const { job, ambiguous } = resolveCancelableJob(jobs, ref, { sessionId });
 
   if (ambiguous) {
     console.error("Multiple running jobs. Please specify a job ID prefix.");
@@ -592,25 +625,35 @@ async function handleCancel(argv) {
   // Abort the OpenCode session if we have one
   if (job.opencodeSessionId) {
     try {
-      const client = createClient("http://127.0.0.1:4096");
+      const client = createClient(defaultServerUrl());
       await client.abortSession(job.opencodeSessionId);
     } catch {
       // Server may not be running
     }
   }
 
-  // Kill the process if we have a PID
+  // Kill the worker if its pid is still alive AND still owned by this job
+  // (guards against signalling an unrelated process that recycled the pid).
   if (job.pid) {
+    let alive = false;
     try {
-      process.kill(job.pid, "SIGTERM");
-    } catch {
-      // Process may already be gone
+      process.kill(job.pid, 0);
+      alive = true;
+    } catch (e) {
+      alive = e.code === "EPERM";
+    }
+    if (alive) {
+      try {
+        process.kill(job.pid, "SIGTERM");
+      } catch {
+        // race: gone between the liveness check and the signal
+      }
     }
   }
 
   upsertJob(workspace, {
     id: job.id,
-    status: "failed",
+    status: "canceled",
     completedAt: new Date().toISOString(),
     errorMessage: "Canceled by user",
   });
@@ -658,12 +701,31 @@ function extractResponseText(response) {
  * @returns {object|null}
  */
 function tryParseJson(text) {
-  // Look for JSON in the text (may be wrapped in markdown code blocks)
-  const jsonMatch = text.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
-  const candidate = jsonMatch ? jsonMatch[1] : text;
-  try {
-    return JSON.parse(candidate.trim());
-  } catch {
-    return null;
+  if (typeof text !== "string") return null;
+  const candidates = [];
+
+  // All fenced blocks — prefer ```json-tagged ones, then any fenced block.
+  const fences = [...text.matchAll(/```(json)?\s*\n([\s\S]*?)```/g)];
+  for (const m of fences) {
+    if (m[1]) candidates.push(m[2]); // json-tagged first
   }
+  for (const m of fences) {
+    if (!m[1]) candidates.push(m[2]);
+  }
+  // Bare object/array spanning the first "{"/"[" to the last "}"/"]".
+  const braceStart = text.search(/[[{]/);
+  if (braceStart !== -1) {
+    const braceEnd = Math.max(text.lastIndexOf("}"), text.lastIndexOf("]"));
+    if (braceEnd > braceStart) candidates.push(text.slice(braceStart, braceEnd + 1));
+  }
+  candidates.push(text); // last resort: the whole thing
+
+  for (const c of candidates) {
+    try {
+      return JSON.parse(c.trim());
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null;
 }
