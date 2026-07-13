@@ -372,7 +372,11 @@ export function createClient(baseUrl, opts = {}) {
           acc.reasoning += reasoning;
           acc.cacheRead += cacheRead;
           acc.cacheWrite += cacheWrite;
-          if (typeof info.cost === "number") acc.cost += info.cost;
+          // Lenient parse: some builds serialize cost as a numeric string
+          // (e.g. "0.0123" from a DB TEXT column); Number() handles both and
+          // Number.isFinite filters undefined/null/garbage.
+          const cost = Number(info.cost);
+          if (Number.isFinite(cost)) acc.cost += cost;
           acc.turns += 1;
         }
         return acc;

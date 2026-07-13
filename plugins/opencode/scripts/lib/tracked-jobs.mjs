@@ -2,7 +2,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDir, appendLine } from "./fs.mjs";
+import { ensureDir, appendLine, pidStartTime } from "./fs.mjs";
 import { generateJobId, upsertJob, jobLogPath, jobDataPath } from "./state.mjs";
 
 const SESSION_ID_ENV = "OPENCODE_COMPANION_SESSION_ID";
@@ -44,8 +44,15 @@ export function createJobRecord(workspacePath, type, meta = {}) {
  * @returns {Promise<object>} the job result
  */
 export async function runTrackedJob(workspacePath, job, runner) {
-  // Mark as running
-  upsertJob(workspacePath, { id: job.id, status: "running", pid: process.pid });
+  // Mark as running. Record pidStart alongside pid so isOwnedProcessAlive can
+  // fingerprint this worker even when it was launched directly (e.g. task-worker
+  // invoked without the parent spawn path that would otherwise set pidStart).
+  upsertJob(workspacePath, {
+    id: job.id,
+    status: "running",
+    pid: process.pid,
+    pidStart: pidStartTime(process.pid),
+  });
 
   const logFile = jobLogPath(workspacePath, job.id);
   ensureDir(path.dirname(logFile));

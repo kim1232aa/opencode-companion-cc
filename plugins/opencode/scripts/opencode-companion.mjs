@@ -309,9 +309,13 @@ async function handleTask(argv) {
     if (options.model) workerArgs.push("--model", options.model);
 
     const bgChild = spawnDetached("node", workerArgs, { cwd: workspace });
-    if (bgChild?.pid) {
-      upsertJob(workspace, { id: job.id, pid: bgChild.pid, pidStart: pidStartTime(bgChild.pid) });
+    if (!bgChild?.pid) {
+      const msg = "Failed to start the OpenCode worker process.";
+      upsertJob(workspace, { id: job.id, status: "failed", completedAt: new Date().toISOString(), errorMessage: msg });
+      console.error(`OpenCode task ${job.id}: ${msg}`);
+      process.exit(1);
     }
+    upsertJob(workspace, { id: job.id, pid: bgChild.pid, pidStart: pidStartTime(bgChild.pid) });
     console.log(`OpenCode task started in background: ${job.id}`);
     console.log("Check `/opencode:status` for progress.");
     return;
@@ -435,7 +439,16 @@ async function handleWaitAndResult(argv) {
   if (options.model) workerArgs.push("--model", options.model);
 
   const child = spawnDetached("node", workerArgs, { cwd: workspace });
-  if (child?.pid) upsertJob(workspace, { id: job.id, pid: child.pid, pidStart: pidStartTime(child.pid) });
+  if (!child?.pid) {
+    // Spawn failed (e.g. node missing, ARG_MAX exceeded by a huge task-text).
+    // Without a pid the polling loop can't detect the dead worker and would
+    // block for the full timeout — fail fast instead.
+    const msg = "Failed to start the OpenCode worker process.";
+    upsertJob(workspace, { id: job.id, status: "failed", completedAt: new Date().toISOString(), errorMessage: msg });
+    console.error(`Task ${job.id}: ${msg}`);
+    process.exit(1);
+  }
+  upsertJob(workspace, { id: job.id, pid: child.pid, pidStart: pidStartTime(child.pid) });
 
   const timeoutMs = Number(options["timeout-ms"]) > 0
     ? Number(options["timeout-ms"])
@@ -667,6 +680,15 @@ async function handleCancel(argv) {
     }
   }
 
+  // Re-read the job before overwriting its status: the worker may have finished
+  // (status → completed/failed) during the abortSession HTTP round-trip. Don't
+  // clobber a real terminal result with a misleading "canceled".
+  const fresh = loadState(workspace).jobs?.find((j) => j.id === job.id);
+  if (fresh && fresh.status !== "running" && fresh.status !== "pending") {
+    console.log(`Job ${job.id} already ${fresh.status}; nothing to cancel.`);
+    return;
+  }
+
   upsertJob(workspace, {
     id: job.id,
     status: "canceled",
@@ -687,10 +709,13 @@ async function handleCancel(argv) {
  * @returns {string}
  */
 function extractResponseText(response) {
+  if (response == null) return "";
   if (typeof response === "string") return response;
 
   // Response shape: { info: { ... }, parts: [ { type: "text", text: "..." }, ... ] }
-  if (response?.parts) {
+  // Guard Array.isArray so a non-array `parts` (API anomaly) falls through to
+  // the info.content / stringify fallbacks instead of throwing on `.filter`.
+  if (Array.isArray(response.parts)) {
     return response.parts
       .filter((p) => p.type === "text")
       .map((p) => p.text)

@@ -35,4 +35,12 @@ background workers; opt-in git-worktree isolation (--worktree) with a
 temp-file patch round-trip; a wait-and-result blocking dispatch made the
 default rescue path; and removal of the dead --scope review flag.
 
+Additional modifications in v2.0.2 (from an adversarial multi-model review of
+the codebase): a start-time fingerprint on the file-lock owner token so a live
+holder's lock is never stolen on age; cancel re-reads job status before
+overwriting it; fail-fast when a worker cannot be spawned; parse guards so a
+value option never swallows a following flag; git add/diff exit-code checks and
+subdirectory-aware cwd in the worktree round-trip; a total timeout with SIGKILL
+escalation in runCommand; and lenient numeric-string parsing of session cost.
+
 Licensed under the Apache License, Version 2.0. See the LICENSE file.

@@ -1,8 +1,11 @@
 // Job control: query, sort, enrich, and build status snapshots.
 
-import fs from "node:fs";
-import { tailLines } from "./fs.mjs";
+import { tailLines, pidStartTime } from "./fs.mjs";
 import { jobLogPath, upsertJob, loadState } from "./state.mjs";
+
+// pidStartTime lives in fs.mjs (the lowest-level module, so the file lock can
+// use it too); re-export it here to keep existing importers working.
+export { pidStartTime };
 
 /**
  * True if the given pid is currently alive. Missing/invalid pid ⇒ dead.
@@ -15,32 +18,6 @@ function isPidAlive(pid) {
     return true;
   } catch (err) {
     return err.code === "EPERM"; // exists but not signalable by us
-  }
-}
-
-/**
- * Read a process's kernel start-time (jiffies since boot, field 22 of
- * /proc/<pid>/stat) as an ownership fingerprint. Two processes with the same
- * pid but different start-times are NOT the same process — this is how we tell
- * "our worker" apart from an unrelated process that later recycled the pid.
- * Linux-only; returns null when /proc is unavailable or unreadable.
- * @param {number} pid
- * @returns {string|null}
- */
-export function pidStartTime(pid) {
-  if (!pid || !Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    // The comm field (field 2) is parenthesized and may contain spaces/parens;
-    // split on the LAST ")" so the remaining fields align to their numbers.
-    const rparen = stat.lastIndexOf(")");
-    if (rparen < 0) return null;
-    const rest = stat.slice(rparen + 2).split(" ");
-    // After comm, field 3 (state) is rest[0]; starttime is field 22 ⇒ rest[19].
-    const starttime = rest[19];
-    return starttime && /^\d+$/.test(starttime) ? starttime : null;
-  } catch {
-    return null;
   }
 }
 

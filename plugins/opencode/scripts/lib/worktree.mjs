@@ -12,7 +12,9 @@ import path from "node:path";
 import { runCommand } from "./process.mjs";
 
 async function git(cwd, args, opts = {}) {
-  return runCommand("git", args, { cwd, ...opts });
+  // A total timeout so a wedged git (e.g. blocked on a held index.lock) can't
+  // hang the worker indefinitely; callers may override via opts.timeoutMs.
+  return runCommand("git", args, { cwd, timeoutMs: 120_000, ...opts });
 }
 
 async function isGitRepo(dir) {
@@ -46,8 +48,11 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
   }
 
   const top = (await repoToplevel(dir)) || dir;
+  // Sanitize jobId before it becomes a path segment (defense-in-depth; ids are
+  // generated safe, but never let one traverse out of the worktrees dir).
+  const safeJob = path.basename(String(jobId)) || "job";
   const wtParent = path.join(top, ".opencode-worktrees");
-  const wtPath = path.join(wtParent, jobId);
+  const wtPath = path.join(wtParent, safeJob);
 
   const add = await git(top, ["worktree", "add", "--detach", wtPath, "HEAD"]);
   if (add.exitCode !== 0) {
@@ -55,15 +60,33 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
     return fn(dir);
   }
 
+  // If `dir` was a subdirectory of the repo, run the task in the matching
+  // subdirectory INSIDE the worktree — not the worktree root — so OpenCode's
+  // cwd and visible file scope match what the caller asked for.
+  const rel = path.relative(top, dir);
+  const effectiveCwd =
+    rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? path.join(wtPath, rel) : wtPath;
+
   let patchFile = null;
   let keepWorktree = false;
   try {
-    const result = await fn(wtPath);
+    const result = await fn(effectiveCwd);
 
     // Capture everything the task changed in the worktree as one patch.
-    await git(wtPath, ["add", "-A"]);
+    // Check exit codes: a failed add/diff (index.lock, disk full, corrupt repo)
+    // would otherwise yield an empty patch and SILENTLY discard the task's
+    // changes when the worktree is removed below.
+    const added = await git(wtPath, ["add", "-A"]);
+    if (added.exitCode !== 0) {
+      keepWorktree = true;
+      throw new Error(`git add -A failed in worktree (${added.stderr.trim() || "unknown error"}); changes preserved at ${wtPath}.`);
+    }
     const MAX_PATCH = 128 * 1024 * 1024;
     const diff = await git(wtPath, ["diff", "--cached", "--binary", "HEAD"], { maxOutputBytes: MAX_PATCH });
+    if (diff.exitCode !== 0) {
+      keepWorktree = true;
+      throw new Error(`git diff failed in worktree (${diff.stderr.trim() || "unknown error"}); changes preserved at ${wtPath}.`);
+    }
     const patch = diff.stdout || "";
 
     // A truncated diff would corrupt the patch and apply garbage — refuse it.
@@ -76,7 +99,7 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
     if (patch.trim()) {
       // runCommand cannot feed stdin (stdio[0] === "ignore"), so `git apply -`
       // would read nothing. Write the patch to a temp file and apply from it.
-      patchFile = path.join(os.tmpdir(), `opencode-wt-${jobId}.patch`);
+      patchFile = path.join(os.tmpdir(), `opencode-wt-${safeJob}.patch`);
       fs.writeFileSync(patchFile, patch);
       const apply = await runCommand("git", ["-C", top, "apply", "--whitespace=nowarn", patchFile])
         .catch((e) => ({ exitCode: 1, stderr: e.message, stdout: "" }));
@@ -94,10 +117,15 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
     }
     // Leave the worktree in place when apply failed/overflowed so the user can recover.
     if (!keepWorktree) {
-      await git(top, ["worktree", "remove", "--force", wtPath]).catch(() => {});
-      // Remove the now-empty parent dir (best-effort; fails harmlessly if other
-      // concurrent worktrees still live under it).
-      try { fs.rmdirSync(wtParent); } catch { /* not empty or gone — fine */ }
+      const rm = await git(top, ["worktree", "remove", "--force", wtPath])
+        .catch((e) => ({ exitCode: 1, stderr: e.message }));
+      if (rm.exitCode !== 0) {
+        log(`Warning: could not remove worktree ${wtPath} (${(rm.stderr || "").trim() || "unknown error"}); it may need manual cleanup via 'git worktree remove'.`);
+      } else {
+        // Remove the now-empty parent dir (best-effort; fails harmlessly if
+        // other concurrent worktrees still live under it).
+        try { fs.rmdirSync(wtParent); } catch { /* not empty or gone — fine */ }
+      }
     }
   }
 }

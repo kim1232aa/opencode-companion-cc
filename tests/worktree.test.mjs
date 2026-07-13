@@ -59,6 +59,29 @@ describe("withWorktree", { skip: !hasGit }, () => {
     assert.ok(logs.some((l) => /applied/i.test(l)), logs.join(" | "));
   });
 
+  it("runs in the matching SUBDIR inside the worktree when dir is a repo subdir", async () => {
+    const sub = path.join(repo, "pkg", "inner");
+    fs.mkdirSync(sub, { recursive: true });
+    fs.writeFileSync(path.join(sub, "keep.txt"), "x\n");
+    git(repo, ["add", "-A"]);
+    git(repo, ["commit", "-qm", "add sub"]);
+
+    let seenCwd = null;
+    await withWorktree(
+      { dir: sub, jobId: "job-sub", useWorktree: true, isWrite: true },
+      async (cwd) => {
+        seenCwd = cwd;
+        // cwd must be the worktree's copy of pkg/inner, not the worktree root.
+        assert.ok(cwd.includes(path.join(".opencode-worktrees", "job-sub", "pkg", "inner")), cwd);
+        fs.writeFileSync(path.join(cwd, "made.txt"), "sub\n");
+      }
+    );
+    assert.ok(seenCwd.endsWith(path.join("pkg", "inner")), seenCwd);
+    // Change applied back to the real subdir.
+    assert.equal(fs.readFileSync(path.join(sub, "made.txt"), "utf8"), "sub\n");
+    assert.ok(!fs.existsSync(path.join(repo, ".opencode-worktrees")));
+  });
+
   it("runs directly in the repo when isolation is not requested", async () => {
     let seen = null;
     await withWorktree(

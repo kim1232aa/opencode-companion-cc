@@ -38,7 +38,17 @@ export function parseArgs(argv, schema = {}) {
       if (inlineValue !== undefined) {
         options[key] = inlineValue;
       } else {
-        options[key] = argv[++i] ?? "";
+        // Don't swallow a following option as this flag's value: `--model
+        // --write` must not set model="--write" (which later throws in
+        // parseModelRef and silently drops --write). Treat it as a missing
+        // value instead.
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith("--")) {
+          process.stderr.write(`warning: --${key} expects a value but none was given\n`);
+          options[key] = "";
+        } else {
+          options[key] = argv[++i];
+        }
       }
     } else if (boolSet.has(key)) {
       options[key] = true;
@@ -81,7 +91,11 @@ export function extractTaskText(argv, flagsWithValue = [], booleanFlags = []) {
         key = key.slice(0, eqIdx);
         // inline value form: no next token to consume
       } else if (valSet.has(key)) {
-        i++; // skip value token
+        // Mirror parseArgs: only consume the next token as this flag's value
+        // when it isn't itself an option, so a stray `--model --write` doesn't
+        // eat --write and mis-split the remaining task text.
+        const next = argv[i + 1];
+        if (next !== undefined && !next.startsWith("--")) i++;
       }
       // skip boolean flags silently
       continue;

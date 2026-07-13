@@ -83,12 +83,43 @@ export function runCommand(cmd, args, opts = {}) {
     let stderr = "";
     let settled = false;
     let overflowed = false;
+    let timedOut = false;
     let stdoutBytes = 0;
     let stderrBytes = 0;
     const maxOutputBytes =
       typeof opts.maxOutputBytes === "number" && opts.maxOutputBytes >= 0
         ? opts.maxOutputBytes
         : undefined;
+    const timeoutMs =
+      typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : undefined;
+
+    let killTimer = null;
+    let graceTimer = null;
+    // SIGTERM, then SIGKILL after a short grace — so a child that ignores
+    // SIGTERM (or leaves grandchildren holding the pipe) can't wedge us open.
+    const escalateKill = () => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+      graceTimer = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }, 2000);
+      graceTimer.unref?.();
+    };
+
+    if (timeoutMs !== undefined) {
+      killTimer = setTimeout(() => {
+        timedOut = true;
+        escalateKill();
+      }, timeoutMs);
+      killTimer.unref?.();
+    }
 
     proc.stdout.on("data", (d) => {
       if (settled || overflowed) return;
@@ -100,7 +131,7 @@ export function runCommand(cmd, args, opts = {}) {
             stdout += d.subarray(0, remaining).toString();
             stdoutBytes += remaining;
           }
-          proc.kill();
+          escalateKill();
           return;
         }
         stdout += d;
@@ -119,7 +150,7 @@ export function runCommand(cmd, args, opts = {}) {
             stderr += d.subarray(0, remaining).toString();
             stderrBytes += remaining;
           }
-          proc.kill();
+          escalateKill();
           return;
         }
         stderr += d;
@@ -128,17 +159,26 @@ export function runCommand(cmd, args, opts = {}) {
       }
       stderr += d;
     });
+    const clearTimers = () => {
+      if (killTimer) clearTimeout(killTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+    };
     proc.on("error", (err) => {
       if (settled) return;
       settled = true;
+      clearTimers();
       reject(new Error(`Failed to spawn command '${cmd}': ${err.message}`));
     });
     proc.on("close", (exitCode) => {
       if (settled) return;
       settled = true;
+      clearTimers();
       const result = { stdout, stderr, exitCode: exitCode ?? 1 };
       if (maxOutputBytes !== undefined) {
         result.overflowed = overflowed;
+      }
+      if (timeoutMs !== undefined) {
+        result.timedOut = timedOut;
       }
       resolve(result);
     });
