@@ -54,6 +54,19 @@ calls = working; frozen across several = genuinely stuck.
   server whether the session is still active — never infer death from a stale
   log line.
 
+## "completed" is not always "succeeded"
+
+`status`/`result` distinguish these — do not treat every terminal job as a win:
+- ❌ **failed** shows its error (surfaced at the top of `status`).
+- ✅ **completed** with output = success.
+- **`⚠️ no output` / "No output" = completed but the model produced nothing
+  usable** (some models return an empty turn). That is NOT a success — retry
+  with a different `--model` or a rephrased task.
+- With several concurrent jobs, read the whole `status` dashboard: each running
+  job shows a live token count and how long since its last update, so you can
+  tell generating (tokens rising) from stuck (frozen + old "updated … ago")
+  from failed — without watching any single one.
+
 ## A dead worker does not mean a lost result
 
 If a worker was hard-killed (OOM / SIGKILL) after its prompt was dispatched, the
