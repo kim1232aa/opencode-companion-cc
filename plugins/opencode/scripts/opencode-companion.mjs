@@ -10,7 +10,7 @@ import fs from "node:fs";
 
 import { parseArgs, extractTaskText } from "./lib/args.mjs";
 import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/process.mjs";
-import { isServerRunning, ensureServer, createClient, connect, suggestModelRefs } from "./lib/opencode-server.mjs";
+import { isServerRunning, ensureServer, createClient, connect, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
@@ -164,10 +164,6 @@ async function handleReview(argv) {
       report("starting", "Connecting to OpenCode server...");
       const client = await connect({ cwd: workspace });
 
-      report("reviewing", "Creating review session...");
-      const session = await client.createSession({ title: `Code Review ${job.id}` });
-      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id });
-
       const prompt = await buildReviewPrompt(workspace, {
         base: options.base,
         adversarial: false,
@@ -176,17 +172,24 @@ async function handleReview(argv) {
       report("reviewing", "Running review...");
       log(`Prompt length: ${prompt.length} chars${options.model ? `, model: ${options.model}` : ""}`);
 
-      const response = await client.sendPrompt(session.id, prompt, {
-        agent: "plan", // read-only agent for reviews
-        model: options.model,
+      // Retry a transient 500 / hang on a fresh session; an empty (deterministic)
+      // turn fails honestly. dispatchWithRetry owns the heartbeat + stall watchdog.
+      const dispatch = await dispatchWithRetry({
+        client, prompt, agent: "plan", model: options.model, // read-only agent for reviews
+        extract: extractResponseText, log,
+        makeSession: () => client.createSession({ title: `Code Review ${job.id}` }),
+        onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
       });
+      const response = dispatch.response;
+      const sessionId = dispatch.sessionId;
+      if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
 
       report("finalizing", "Processing review output...");
 
       // Try to parse structured output
       const text = extractResponseText(response);
       let structured = tryParseJson(text);
-      const usage = await client.getSessionUsage(session.id).catch(() => null);
+      const usage = await client.getSessionUsage(sessionId).catch(() => null);
 
       return {
         rendered: structured ? renderReview(structured) : text,
@@ -224,10 +227,6 @@ async function handleAdversarialReview(argv) {
       report("starting", "Connecting to OpenCode server...");
       const client = await connect({ cwd: workspace });
 
-      report("reviewing", "Creating adversarial review session...");
-      const session = await client.createSession({ title: `Adversarial Review ${job.id}` });
-      upsertJob(workspace, { id: job.id, opencodeSessionId: session.id });
-
       const prompt = await buildReviewPrompt(workspace, {
         base: options.base,
         adversarial: true,
@@ -237,16 +236,21 @@ async function handleAdversarialReview(argv) {
       report("reviewing", "Running adversarial review...");
       log(`Prompt length: ${prompt.length} chars, focus: ${focus || "(none)"}${options.model ? `, model: ${options.model}` : ""}`);
 
-      const response = await client.sendPrompt(session.id, prompt, {
-        agent: "plan",
-        model: options.model,
+      const dispatch = await dispatchWithRetry({
+        client, prompt, agent: "plan", model: options.model,
+        extract: extractResponseText, log,
+        makeSession: () => client.createSession({ title: `Adversarial Review ${job.id}` }),
+        onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
       });
+      const response = dispatch.response;
+      const sessionId = dispatch.sessionId;
+      if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
 
       report("finalizing", "Processing review output...");
 
       const text = extractResponseText(response);
       let structured = tryParseJson(text);
-      const usage = await client.getSessionUsage(session.id).catch(() => null);
+      const usage = await client.getSessionUsage(sessionId).catch(() => null);
 
       return {
         rendered: structured ? renderReview(structured) : text,
@@ -349,48 +353,20 @@ async function handleTask(argv) {
         const client = await connect({ cwd: effectiveCwd });
         options.model = await resolveModelAvailable(client, options.model);
 
-        let sessionId;
-        if (resumeSessionId) {
-          report("starting", `Resuming OpenCode session ${resumeSessionId}...`);
-          sessionId = resumeSessionId;
-        } else {
-          report("starting", "Creating new OpenCode session...");
-          const session = await client.createSession({ title: `Task ${job.id}` });
-          sessionId = session.id;
-        }
-        upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId });
-
         const prompt = buildTaskPrompt(taskText, { write: isWrite });
-
         report("investigating", "Sending task to OpenCode...");
         log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${options.model ?? "(provider default)"}`);
 
-        // Same token-progress heartbeat as the background worker: lets `status`
-        // (from another window) distinguish "generating" from "stuck".
-        const heartbeat = setInterval(async () => {
-          const u = await client
-            .getSessionUsage(sessionId, { timeoutMs: 8_000 })
-            .catch(() => null);
-          // Log every beat (even at 0 tokens) so log freshness tracks worker
-          // liveness: fresh + 0 tokens = connected but the model is silent (a
-          // hung turn); stale = the worker itself is gone.
-          if (u) {
-            log(u.total > 0
-              ? `heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`
-              : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
-          }
-        }, 30_000);
-        heartbeat.unref?.();
-
-        let response;
-        try {
-          response = await client.sendPrompt(sessionId, prompt, {
-            agent: agentName,
-            model: options.model,
-          });
-        } finally {
-          clearInterval(heartbeat);
-        }
+        // Retry a transient 500 / empty turn / hang on a fresh session.
+        const dispatch = await dispatchWithRetry({
+          client, prompt, agent: agentName, model: options.model,
+          extract: extractResponseText, log, resumeSessionId,
+          makeSession: () => client.createSession({ title: `Task ${job.id}` }),
+          onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
+        });
+        const response = dispatch.response;
+        const sessionId = dispatch.sessionId;
+        if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
 
         report("finalizing", "Processing task output...");
 
@@ -576,49 +552,23 @@ async function handleTaskWorker(argv) {
         const client = await connect({ cwd: effectiveCwd });
         options.model = await resolveModelAvailable(client, options.model);
 
-        let sessionId;
-        if (resumeSessionId) {
-          sessionId = resumeSessionId;
-          report("starting", `Resuming session ${resumeSessionId}...`);
-        } else {
-          const session = await client.createSession({ title: `Task ${jobId}` });
-          sessionId = session.id;
-          report("starting", `Created session ${sessionId}`);
-        }
-        upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId });
-
         const prompt = buildTaskPrompt(taskText, { write: isWrite });
-        report("investigating", "Running task...");
+        report("investigating", resumeSessionId ? `Resuming session ${resumeSessionId}...` : "Running task...");
 
-        // Heartbeat: while sendPrompt blocks (often 15-30+ min), poll the
-        // server's live token count into the job log every 30s. `status` shows
-        // the log tail, so a user can tell "still generating" (tokens climbing)
-        // from "actually stuck" (frozen across polls) — the job log otherwise
-        // only changes on phase transitions.
-        const heartbeat = setInterval(async () => {
-          const u = await client
-            .getSessionUsage(sessionId, { timeoutMs: 8_000 })
-            .catch(() => null);
-          // Log every beat (even at 0 tokens) so log freshness tracks worker
-          // liveness: fresh + 0 tokens = connected but the model is silent (a
-          // hung turn); stale = the worker itself is gone.
-          if (u) {
-            log(u.total > 0
-              ? `heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`
-              : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
-          }
-        }, 30_000);
-        heartbeat.unref?.();
-
-        let response;
-        try {
-          response = await client.sendPrompt(sessionId, prompt, {
-            agent: agentName,
-            model: options.model,
-          });
-        } finally {
-          clearInterval(heartbeat);
-        }
+        // Dispatch with retries: a transient 500 or a hang (no token progress)
+        // is retried on a fresh session; an empty (deterministic) turn fails
+        // honestly. dispatchWithRetry owns the token heartbeat + stall watchdog,
+        // and onSession keeps the job's opencodeSessionId pointed at the live
+        // session across retries.
+        const dispatch = await dispatchWithRetry({
+          client, prompt, agent: agentName, model: options.model,
+          extract: extractResponseText, log, resumeSessionId,
+          makeSession: () => client.createSession({ title: `Task ${jobId}` }),
+          onSession: (sid) => upsertJob(workspace, { id: jobId, opencodeSessionId: sid }),
+        });
+        const response = dispatch.response;
+        const sessionId = dispatch.sessionId;
+        if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
 
         const text = extractResponseText(response);
         const usage = await client.getSessionUsage(sessionId).catch(() => null);
