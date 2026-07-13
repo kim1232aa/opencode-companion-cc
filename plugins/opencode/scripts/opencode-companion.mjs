@@ -10,7 +10,7 @@ import fs from "node:fs";
 
 import { parseArgs, extractTaskText } from "./lib/args.mjs";
 import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/process.mjs";
-import { isServerRunning, ensureServer, createClient, connect } from "./lib/opencode-server.mjs";
+import { isServerRunning, ensureServer, createClient, connect, suggestModelRefs } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
@@ -27,6 +27,26 @@ const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.d
 function defaultServerUrl() {
   const port = Number(process.env.OPENCODE_SERVER_PORT) || 4096;
   return `http://127.0.0.1:${port}`;
+}
+
+// Validate a --model ref against the server's real model list; throw a helpful
+// suggestion (missing provider prefix is the usual mistake) instead of letting
+// a wrong ref fail mid-run with an opaque 500.
+async function resolveModelAvailable(client, model) {
+  if (!model) return model;
+  const refs = await client.listModelRefs().catch(() => null);
+  if (!refs || !refs.size || refs.has(model)) return model;
+  // Unambiguous dropped-provider-prefix ref ⇒ auto-fix (the token line then
+  // shows what actually ran). OpenCode's UI shows the provider NAME (e.g.
+  // "freeapi"), not the ID (e.g. "volcano-coding"), so this is a common slip.
+  const exact = suggestModelRefs(refs, model, 50).filter((r) => r.endsWith(`/${model}`));
+  if (exact.length === 1) return exact[0];
+  const sugg = suggestModelRefs(refs, model);
+  throw new Error(
+    `Model "${model}" is not available on the OpenCode server.` +
+    (sugg.length ? ` Did you mean: ${sugg.join("  |  ")} ?` : "") +
+    ` A ref is <providerID>/<modelID>; the provider ID (e.g. volcano-coding) is NOT the name shown in OpenCode's UI (e.g. freeapi). Run \`/opencode:setup\` to list provider IDs.`
+  );
 }
 
 // ------------------------------------------------------------------
@@ -327,6 +347,7 @@ async function handleTask(argv) {
       withWorktree({ dir: workspace, jobId: job.id, useWorktree, isWrite }, async (effectiveCwd) => {
         report("starting", "Connecting to OpenCode server...");
         const client = await connect({ cwd: effectiveCwd });
+        options.model = await resolveModelAvailable(client, options.model);
 
         let sessionId;
         if (resumeSessionId) {
@@ -548,6 +569,7 @@ async function handleTaskWorker(argv) {
       withWorktree({ dir: workspace, jobId, useWorktree, isWrite }, async (effectiveCwd) => {
         report("starting", "Background worker connecting to OpenCode...");
         const client = await connect({ cwd: effectiveCwd });
+        options.model = await resolveModelAvailable(client, options.model);
 
         let sessionId;
         if (resumeSessionId) {
