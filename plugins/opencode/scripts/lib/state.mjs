@@ -3,21 +3,64 @@
 // JSON state file, per-job files and logs.
 
 import crypto from "node:crypto";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { ensureDir, readJson, writeJson, withFileLock } from "./fs.mjs";
 
 const MAX_JOBS = 50;
 
 /**
- * Compute the state directory root for a workspace.
+ * Derive THIS plugin's own data dir from the script's install path, instead of
+ * blindly trusting process.env.CLAUDE_PLUGIN_DATA. That env var is exported by
+ * whichever plugin's shell wrapper last ran, so if another companion plugin
+ * (e.g. codex) set it, our job state would silently be written into *their*
+ * data dir — where our own status/result/cancel can never find it again.
+ * Claude Code installs plugins at
+ *   <root>/plugins/cache/<owner>-<repo>/<plugin>/<version>/scripts/lib/state.mjs
+ * and gives each plugin its own data dir at
+ *   <root>/plugins/data/<plugin>-<owner>-<repo>/
+ * Returns null when the path layout doesn't match (dev/source checkout).
+ * @returns {string|null}
+ */
+function deriveOwnDataDir() {
+  try {
+    const parts = fileURLToPath(import.meta.url).split(path.sep);
+    const cacheIdx = parts.lastIndexOf("cache");
+    if (cacheIdx < 1 || cacheIdx + 3 >= parts.length) return null;
+    const ownerRepo = parts[cacheIdx + 1];
+    const pluginName = parts[cacheIdx + 2];
+    const rootBase = parts.slice(0, cacheIdx).join(path.sep);
+    return path.join(rootBase, "data", `${pluginName}-${ownerRepo}`);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compute the state directory root for a workspace. Data-dir priority:
+ *   1. OPENCODE_COMPANION_DATA (explicit opt-in override)
+ *   2. our own install-derived data dir
+ *   3. CLAUDE_PLUGIN_DATA — ONLY if it actually names an opencode dir (guards
+ *      against inheriting another plugin's exported value)
+ *   4. os.tmpdir()/opencode-companion  (fixes the old hardcoded "/tmp")
  * @param {string} workspacePath
  * @returns {string}
  */
 export function stateRoot(workspacePath) {
-  const base =
-    process.env.CLAUDE_PLUGIN_DATA
-      ? path.join(process.env.CLAUDE_PLUGIN_DATA, "state")
-      : path.join("/tmp", "opencode-companion");
+  let base;
+  const override = process.env.OPENCODE_COMPANION_DATA;
+  const own = deriveOwnDataDir();
+  const envData = process.env.CLAUDE_PLUGIN_DATA;
+  if (override) {
+    base = path.join(override, "state");
+  } else if (own) {
+    base = path.join(own, "state");
+  } else if (envData && /opencode/i.test(path.basename(envData))) {
+    base = path.join(envData, "state");
+  } else {
+    base = path.join(os.tmpdir(), "opencode-companion");
+  }
   const hash = crypto.createHash("sha256").update(workspacePath).digest("hex").slice(0, 16);
   return path.join(base, hash);
 }
@@ -96,10 +139,18 @@ export function upsertJob(workspacePath, job) {
     } else {
       state.jobs.push({ ...job, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
     }
-    // Prune old jobs beyond MAX_JOBS
+    // Prune old jobs beyond MAX_JOBS — but NEVER evict a non-terminal job.
+    // A long-running/pending job whose updatedAt ages behind 50 newer jobs
+    // would otherwise be dropped mid-flight, losing its status/pid/metadata
+    // and becoming invisible to status/result/cancel.
     if (state.jobs.length > MAX_JOBS) {
-      state.jobs.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-      state.jobs = state.jobs.slice(0, MAX_JOBS);
+      const terminal = (j) => j.status === "completed" || j.status === "failed";
+      const active = state.jobs.filter((j) => !terminal(j));
+      const done = state.jobs
+        .filter(terminal)
+        .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+      const keepDone = Math.max(0, MAX_JOBS - active.length);
+      state.jobs = [...active, ...done.slice(0, keepDone)];
     }
   });
 }

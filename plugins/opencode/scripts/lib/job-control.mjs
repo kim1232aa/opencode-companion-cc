@@ -85,8 +85,8 @@ export function buildStatusSnapshot(jobs, workspacePath, opts = {}) {
   const sorted = sortJobsNewestFirst(filtered);
   const enriched = sorted.map((j) => enrichJob(j, workspacePath));
 
-  const running = enriched.filter((j) => j.status === "running");
-  const finished = enriched.filter((j) => j.status !== "running");
+  const running = enriched.filter((j) => j.status === "running" || j.status === "pending");
+  const finished = enriched.filter((j) => j.status === "completed" || j.status === "failed");
   const latestFinished = finished[0] ?? null;
   const recent = finished.slice(0, 5);
 
