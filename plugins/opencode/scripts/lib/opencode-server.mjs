@@ -128,18 +128,35 @@ export async function ensureServer(opts = {}) {
     // unless this is set — see https://opencode.ai/docs/tools/
     env: { ...process.env, OPENCODE_ENABLE_EXA: "1" },
   });
+
+  // Drain stdout/stderr into a bounded tail buffer. Two reasons: (1) leaving
+  // "pipe" without a reader lets the OS pipe buffer fill and BLOCK the child
+  // (a latent hang); (2) capturing the tail lets us surface *why* startup
+  // failed instead of an opaque timeout.
+  let diagTail = "";
+  const drain = (chunk) => {
+    diagTail = (diagTail + chunk.toString()).slice(-2000);
+  };
+  proc.stdout?.on("data", drain);
+  proc.stderr?.on("data", drain);
+  let spawnError = null;
+  proc.on("error", (err) => { spawnError = err; });
   proc.unref();
 
   // Wait for the server to become ready
   const deadline = Date.now() + SERVER_START_TIMEOUT;
   while (Date.now() < deadline) {
+    if (spawnError) {
+      throw new Error(`Failed to spawn 'opencode serve': ${spawnError.message}`);
+    }
     if (await isServerRunning(host, port)) {
       return { url, pid: proc.pid, alreadyRunning: false };
     }
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  throw new Error(`OpenCode server failed to start within ${SERVER_START_TIMEOUT / 1000}s`);
+  const detail = diagTail.trim() ? `\nLast output:\n${diagTail.trim()}` : "";
+  throw new Error(`OpenCode server failed to start within ${SERVER_START_TIMEOUT / 1000}s${detail}`);
 }
 
 /**

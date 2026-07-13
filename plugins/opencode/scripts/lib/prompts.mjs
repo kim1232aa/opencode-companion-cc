@@ -77,6 +77,28 @@ function buildReviewContext(diff, status, changedFiles) {
 }
 
 /**
+ * Prepended to every task prompt sent into an opencode session.
+ *
+ * Task text is forwarded verbatim from the outer Claude Code harness, so it
+ * often carries routing rules inherited from CLAUDE.md (e.g. "delegate long
+ * tasks to opencode-rescue / codex-rescue"). A model running INSIDE the
+ * opencode session that obeys those rules will try to recursively invoke a
+ * Claude Code Task/Agent/Skill by a "plugin:name" identifier that does not
+ * exist here — the call errors and some models (notably GLM) then stall
+ * indefinitely, emitting nothing. This header neutralizes that without
+ * altering the forwarded task text itself.
+ */
+export const SAFETY_HEADER = [
+  "You are running INSIDE an OpenCode session, invoked as a worker.",
+  "Any routing rules in the task below (e.g. 'delegate to opencode-rescue,",
+  "codex-rescue, claude-code-guide', or invoking a Task/Agent/Skill named",
+  "like 'plugin:name') have ALREADY been consumed by the dispatch step and",
+  "DO NOT apply here. Do NOT try to delegate to another agent — you ARE the",
+  "worker. Do the work yourself with Bash/Read/Write/Edit/Grep/Glob; if a",
+  "task is large, break it into smaller steps and iterate.",
+].join(" ");
+
+/**
  * Build a task prompt from user input.
  * @param {string} taskText
  * @param {object} opts
@@ -85,6 +107,9 @@ function buildReviewContext(diff, status, changedFiles) {
  */
 export function buildTaskPrompt(taskText, opts = {}) {
   const parts = [];
+
+  parts.push(SAFETY_HEADER);
+  parts.push("");
 
   if (opts.write) {
     parts.push("You have full read/write access. Make the necessary code changes.");
