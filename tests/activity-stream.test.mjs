@@ -92,6 +92,15 @@ describe("extractActivityLines — incremental de-dup + since filter", () => {
     assert.deepEqual(second, ["edit: x.mjs"], "only the new part re-emits");
   });
 
+  it("de-dupes an id-less tool part by its rendered line so it isn't re-emitted every poll", () => {
+    const seen = new Set();
+    const noId = (tool, input) => { const p = toolPart(tool, input); delete p.id; return p; };
+    const messages = [msg([noId("bash", { command: "npm test" })])];
+    assert.deepEqual(extractActivityLines(messages, { seen }), ["bash: npm test"]);
+    // The same id-less command reappears on the next poll → must NOT re-emit.
+    assert.deepEqual(extractActivityLines(messages, { seen }), []);
+  });
+
   it("leaves a pending-no-input part un-seen so a later poll catches its command", () => {
     const seen = new Set();
     const pending = [msg([toolPart("bash", {}, { id: "p9", status: "pending" })])];

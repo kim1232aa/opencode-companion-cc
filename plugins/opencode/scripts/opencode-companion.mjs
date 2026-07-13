@@ -14,7 +14,7 @@ import { isServerRunning, createClient, connect, suggestModelRefs, dispatchWithR
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJobs, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
-import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
+import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, formatUsage, formatTrailer } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
@@ -193,6 +193,7 @@ async function handleReview(argv) {
         extract: extractResponseText, log,
         makeSession: () => client.createSession({ title: `Code Review ${job.id}` }),
         onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
+        shouldStop: () => isJobCanceled(workspace, job.id),
       });
       const response = dispatch.response;
       const sessionId = dispatch.sessionId;
@@ -255,6 +256,7 @@ async function handleAdversarialReview(argv) {
         extract: extractResponseText, log,
         makeSession: () => client.createSession({ title: `Adversarial Review ${job.id}` }),
         onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
+        shouldStop: () => isJobCanceled(workspace, job.id),
       });
       const response = dispatch.response;
       const sessionId = dispatch.sessionId;
@@ -377,6 +379,7 @@ async function handleTask(argv) {
           extract: extractResponseText, log, resumeSessionId,
           makeSession: () => client.createSession({ title: `Task ${job.id}` }),
           onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
+          shouldStop: () => isJobCanceled(workspace, job.id),
         });
         const response = dispatch.response;
         const sessionId = dispatch.sessionId;
@@ -581,6 +584,7 @@ async function handleTaskWorker(argv) {
           extract: extractResponseText, log, resumeSessionId,
           makeSession: () => client.createSession({ title: `Task ${jobId}` }),
           onSession: (sid) => upsertJob(workspace, { id: jobId, opencodeSessionId: sid }),
+          shouldStop: () => isJobCanceled(workspace, jobId),
         });
         const response = dispatch.response;
         const sessionId = dispatch.sessionId;
