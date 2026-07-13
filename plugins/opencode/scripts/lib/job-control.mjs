@@ -1,7 +1,8 @@
 // Job control: query, sort, enrich, and build status snapshots.
 
-import { tailLines, pidStartTime } from "./fs.mjs";
-import { jobLogPath, upsertJob, loadState } from "./state.mjs";
+import { tailLines, pidStartTime, writeJson } from "./fs.mjs";
+import { jobLogPath, jobDataPath, upsertJob, loadState } from "./state.mjs";
+import { createClient } from "./opencode-server.mjs";
 
 // pidStartTime lives in fs.mjs (the lowest-level module, so the file lock can
 // use it too); re-export it here to keep existing importers working.
@@ -80,6 +81,60 @@ export function reconcileStrandedJobs(workspacePath, jobs) {
         status: "failed",
         completedAt: new Date().toISOString(),
         errorMessage: reason,
+      });
+      changed = true;
+    }
+  }
+  return changed ? (loadState(workspacePath).jobs ?? jobs) : jobs;
+}
+
+/**
+ * Salvage results for stranded jobs directly from the OpenCode server BEFORE
+ * they get reconciled to "failed". When a worker is hard-killed (SIGKILL/OOM)
+ * after sending its prompt, it can't write a result — but the OpenCode session
+ * often finished server-side. For each non-terminal job whose worker is gone
+ * and that has an opencodeSessionId, fetch the session's final answer; if there
+ * is one, mark the job completed and persist the recovered result. Best-effort:
+ * any probe failure (server down, no output) leaves the job for reconcile to
+ * mark failed. Returns the refreshed job list.
+ * @param {string} workspacePath
+ * @param {object[]} jobs
+ * @param {string} serverUrl
+ * @returns {Promise<object[]>}
+ */
+export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
+  const candidates = (jobs ?? []).filter((j) => {
+    const terminal = j.status === "completed" || j.status === "failed" || j.status === "canceled";
+    if (terminal || !j.opencodeSessionId) return false;
+    // Only probe when the worker is provably gone; a live worker finishes itself.
+    return j.pid ? !isOwnedProcessAlive(j.pid, j.pidStart) : true;
+  });
+  if (!candidates.length) return jobs;
+
+  const client = createClient(serverUrl);
+  let changed = false;
+  for (const j of candidates) {
+    let text = null;
+    let usage = null;
+    try {
+      text = await client.getSessionResult(j.opencodeSessionId);
+      if (text) usage = await client.getSessionUsage(j.opencodeSessionId).catch(() => null);
+    } catch {
+      text = null;
+    }
+    if (text) {
+      writeJson(jobDataPath(workspacePath, j.id), {
+        rendered: text,
+        usage,
+        recovered: true,
+        summary: text.slice(0, 500),
+      });
+      upsertJob(workspacePath, {
+        id: j.id,
+        status: "completed",
+        completedAt: new Date().toISOString(),
+        result: text.slice(0, 500),
+        recovered: true,
       });
       changed = true;
     }

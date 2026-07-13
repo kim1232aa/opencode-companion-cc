@@ -13,7 +13,7 @@ import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/pr
 import { isServerRunning, ensureServer, createClient, connect } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath } from "./lib/state.mjs";
-import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
+import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, formatUsage } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
@@ -589,9 +589,13 @@ async function handleStatus(argv) {
   const workspace = await resolveWorkspace();
   const sessionId = getClaudeSessionId();
 
-  // Recover any job whose worker died without writing a terminal status, so a
-  // crashed background task stops showing as a phantom "running" forever.
-  const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
+  // For any job whose worker died mid-run: first try to salvage its result from
+  // the OpenCode server (the session often finished server-side), then reconcile
+  // whatever couldn't be recovered to "failed" so nothing shows as a phantom
+  // "running" forever.
+  let jobs = loadState(workspace).jobs ?? [];
+  jobs = await recoverStrandedResults(workspace, jobs, defaultServerUrl());
+  jobs = reconcileStrandedJobs(workspace, jobs);
 
   const snapshot = buildStatusSnapshot(jobs, workspace, { sessionId });
   console.log(renderStatus(snapshot));
@@ -613,7 +617,10 @@ async function handleResult(argv) {
 
   const workspace = await resolveWorkspace();
   const sessionId = getClaudeSessionId();
-  const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
+  // Salvage a dead worker's result from the server before reconciling to failed.
+  let jobs = loadState(workspace).jobs ?? [];
+  jobs = await recoverStrandedResults(workspace, jobs, defaultServerUrl());
+  jobs = reconcileStrandedJobs(workspace, jobs);
 
   const { job, ambiguous } = resolveResultJob(jobs, ref, { sessionId });
 

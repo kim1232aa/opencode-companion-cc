@@ -24,11 +24,14 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
 
 ## Lifecycle / robustness
 
-- **Auto-heal is dead-pid based, not session-probe based.** A background job
-  whose worker dies is reconciled to `failed`. It does not (yet) query the
-  OpenCode server to recover the *result* of a session that actually finished
-  server-side after the worker vanished — that richer recovery from the
-  suharvest fork was not ported.
+- **Auto-heal now probes the session before failing (2.0.3).** When a background
+  worker dies mid-run (e.g. SIGKILL/OOM) after its prompt was sent, `status` and
+  `result` first query the OpenCode server for that session's final answer and,
+  if the session finished server-side, mark the job `completed` and persist the
+  recovered result (flagged `recovered`). Only when the server has no answer (or
+  is unreachable) does the job reconcile to `failed`. Caveat: recovery needs the
+  server to still be up — if the worker AND the server both died, the result is
+  genuinely lost.
 - **No hard per-job wall-clock timeout in `runTrackedJob`.** In practice covered
   by `httpPostJson`'s prompt timeout (`OPENCODE_COMPANION_PROMPT_TIMEOUT_MS`,
   default 30 min), `wait-and-result`'s own bound, and dead-pid reconciliation.

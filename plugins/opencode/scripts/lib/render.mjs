@@ -54,6 +54,9 @@ export function renderResult(job, resultData) {
   if (job.opencodeSessionId) {
     lines.push(`- **OpenCode Session**: ${job.opencodeSessionId}`);
   }
+  if (job.recovered || resultData?.recovered) {
+    lines.push(`> Recovered from the OpenCode server after the worker exited without returning.`);
+  }
   lines.push("");
   if (job.status === "failed") {
     lines.push(`### Error\n\n${job.errorMessage || `Unknown error (job ${job.id})`}`);

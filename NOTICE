@@ -43,4 +43,11 @@ value option never swallows a following flag; git add/diff exit-code checks and
 subdirectory-aware cwd in the worktree round-trip; a total timeout with SIGKILL
 escalation in runCommand; and lenient numeric-string parsing of session cost.
 
+Additional modifications in v2.0.3: server-side result recovery for a worker
+that died after dispatch (getSessionResult / recoverStrandedResults, run by
+status and result before reconciliation); an identity check so a foreign
+service on the port is not mistaken for the OpenCode server; and a stderr job-id
+line plus foreground-blocking dispatch rules so a cut-off wrapper call can still
+recover the result instead of losing it.
+
 Licensed under the Apache License, Version 2.0. See the LICENSE file.

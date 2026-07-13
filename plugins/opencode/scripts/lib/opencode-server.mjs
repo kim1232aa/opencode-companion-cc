@@ -102,7 +102,13 @@ export async function isServerRunning(host = DEFAULT_HOST, port = DEFAULT_PORT) 
     const res = await fetch(`http://${host}:${port}/global/health`, {
       signal: AbortSignal.timeout(3000),
     });
-    return res.ok;
+    if (!res.ok) return false;
+    // Identity check: a foreign service squatting on the port could also answer
+    // 200 here. OpenCode's /global/health returns { healthy, version } — require
+    // that shape so we never treat an unrelated server as our OpenCode and then
+    // dispatch sessions into it.
+    const body = await res.json().catch(() => null);
+    return !!body && (typeof body.healthy === "boolean" || typeof body.version === "string");
   } catch {
     return false;
   }
@@ -380,6 +386,35 @@ export function createClient(baseUrl, opts = {}) {
           acc.turns += 1;
         }
         return acc;
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * Recover a session's final answer directly from the server. Used to salvage
+     * the result of a job whose worker died AFTER the prompt was sent but the
+     * OpenCode session kept running and finished server-side. Returns the last
+     * assistant message's text, or null if unavailable/empty.
+     * @param {string} sessionId
+     * @returns {Promise<string|null>}
+     */
+    getSessionResult: async (sessionId) => {
+      try {
+        const msgs = await request("GET", `/session/${sessionId}/message`);
+        const list = Array.isArray(msgs) ? msgs : [];
+        let lastText = "";
+        for (const m of list) {
+          if (m?.info?.role !== "assistant") continue;
+          const parts = Array.isArray(m.parts) ? m.parts : [];
+          const text = parts
+            .filter((p) => p?.type === "text")
+            .map((p) => p.text)
+            .join("\n")
+            .trim();
+          if (text) lastText = text; // keep the latest non-empty assistant turn
+        }
+        return lastText || null;
       } catch {
         return null;
       }
