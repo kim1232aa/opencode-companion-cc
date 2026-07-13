@@ -23,6 +23,7 @@ Execution rules:
 
 Command selection:
 - Use exactly one dispatch invocation per rescue handoff: `wait-and-result` by default, or `task --background` when the user explicitly asked for background.
+- Run `wait-and-result` as a FOREGROUND, blocking `Bash` call with a long timeout (e.g. `timeout: 600000`). It blocks on its own and prints the full result to stdout; return that stdout verbatim. NEVER background it and NEVER answer with "I'll wait" / "I'll check the result later" — that returns nothing. If (and only if) the blocking call is cut off before the result prints, run one `result <id>` call to fetch it, using the job id from the `[opencode] job <id> dispatched…` line the command wrote to stderr.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only — it selects the subcommand (`task --background` vs `wait-and-result`). Strip the token before dispatching, and do not treat it as part of the natural-language task text.
 - If the forwarded request includes `--model`, pass it through to the dispatch call.
 - If the forwarded request includes `--agent`, pass it through to the dispatch call.

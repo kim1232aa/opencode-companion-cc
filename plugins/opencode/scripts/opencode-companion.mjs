@@ -450,6 +450,12 @@ async function handleWaitAndResult(argv) {
   }
   upsertJob(workspace, { id: job.id, pid: child.pid, pidStart: pidStartTime(child.pid) });
 
+  // Announce the job id on stderr up front. This is a blocking call: the full
+  // result prints to stdout when the worker finishes. But if the wrapper's Bash
+  // call is cut off (its own timeout) before that, this line is still captured,
+  // so the result can be recovered later with `result <id>` instead of lost.
+  process.stderr.write(`[opencode] job ${job.id} dispatched; blocking until it finishes. If this call is cut off, retrieve the result later with: result ${job.id}\n`);
+
   const timeoutMs = Number(options["timeout-ms"]) > 0
     ? Number(options["timeout-ms"])
     : Number(process.env.OPENCODE_COMPANION_WAIT_TIMEOUT_MS) || 35 * 60 * 1000;
