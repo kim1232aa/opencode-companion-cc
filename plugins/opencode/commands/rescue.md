@@ -44,6 +44,6 @@ Operating rules:
 - Do not ask the subagent to inspect files, monitor progress, poll `/opencode:status`, fetch `/opencode:result`, call `/opencode:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--agent` unset unless the user explicitly asks for a specific agent (build or plan).
 - Leave the model unset unless the user explicitly asks for one.
-- Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
+- If `--resume` or `--fresh` is present in the request — whether supplied by the user or added by the resume-check step above — leave it in the forwarded request. The subagent maps `--resume` to `--resume-last` (and `--fresh` to a fresh run) when it builds the `task` command; you do not expand it yourself.
 - If the helper reports that OpenCode is missing or unauthenticated, stop and tell the user to run `/opencode:setup`.
 - If the user did not supply a request, ask what OpenCode should investigate or fix.
