@@ -447,6 +447,8 @@ async function handleWaitAndResult(argv) {
     if (st.status === "completed") {
       const data = readJson(jobDataPath(workspace, job.id));
       console.log(data?.rendered ?? st.result ?? "(task completed with no output)");
+      const usageLine = formatUsage(data?.usage);
+      if (usageLine) console.log(`\n---\n${usageLine}`);
       return true;
     }
     if (st.status === "failed") {

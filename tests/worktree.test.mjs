@@ -53,8 +53,9 @@ describe("withWorktree", { skip: !hasGit }, () => {
     // Changes applied back to the live repo working tree.
     assert.equal(fs.readFileSync(path.join(repo, "created.txt"), "utf8"), "hello\n");
     assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf8"), "base modified\n");
-    // Worktree cleaned up.
+    // Worktree cleaned up — child dir and the now-empty parent both gone.
     assert.ok(!fs.existsSync(path.join(repo, ".opencode-worktrees", "job-apply")));
+    assert.ok(!fs.existsSync(path.join(repo, ".opencode-worktrees")));
     assert.ok(logs.some((l) => /applied/i.test(l)), logs.join(" | "));
   });
 

@@ -46,7 +46,8 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
   }
 
   const top = (await repoToplevel(dir)) || dir;
-  const wtPath = `${top}/.opencode-worktrees/${jobId}`;
+  const wtParent = path.join(top, ".opencode-worktrees");
+  const wtPath = path.join(wtParent, jobId);
 
   const add = await git(top, ["worktree", "add", "--detach", wtPath, "HEAD"]);
   if (add.exitCode !== 0) {
@@ -94,6 +95,9 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
     // Leave the worktree in place when apply failed/overflowed so the user can recover.
     if (!keepWorktree) {
       await git(top, ["worktree", "remove", "--force", wtPath]).catch(() => {});
+      // Remove the now-empty parent dir (best-effort; fails harmlessly if other
+      // concurrent worktrees still live under it).
+      try { fs.rmdirSync(wtParent); } catch { /* not empty or gone — fine */ }
     }
   }
 }
