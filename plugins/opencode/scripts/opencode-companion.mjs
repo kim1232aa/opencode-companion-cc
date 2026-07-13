@@ -371,8 +371,13 @@ async function handleTask(argv) {
           const u = await client
             .getSessionUsage(sessionId, { timeoutMs: 8_000 })
             .catch(() => null);
-          if (u && u.total > 0) {
-            log(`heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`);
+          // Log every beat (even at 0 tokens) so log freshness tracks worker
+          // liveness: fresh + 0 tokens = connected but the model is silent (a
+          // hung turn); stale = the worker itself is gone.
+          if (u) {
+            log(u.total > 0
+              ? `heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`
+              : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
           }
         }, 30_000);
         heartbeat.unref?.();
@@ -594,8 +599,13 @@ async function handleTaskWorker(argv) {
           const u = await client
             .getSessionUsage(sessionId, { timeoutMs: 8_000 })
             .catch(() => null);
-          if (u && u.total > 0) {
-            log(`heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`);
+          // Log every beat (even at 0 tokens) so log freshness tracks worker
+          // liveness: fresh + 0 tokens = connected but the model is silent (a
+          // hung turn); stale = the worker itself is gone.
+          if (u) {
+            log(u.total > 0
+              ? `heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`
+              : `heartbeat: connected, 0 tokens yet (model has not emitted)`);
           }
         }, 30_000);
         heartbeat.unref?.();
