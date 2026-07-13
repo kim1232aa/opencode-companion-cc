@@ -62,8 +62,6 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
 
 ## Cosmetic / minor
 
-- A few `createClient` endpoints (`getProviderAuth`, `subscribeEvents`) are
-  exposed but unused.
 - The Stop-time review gate, when enabled, can block for up to its configured
   timeout (15 min) and is off by default; `/opencode:setup` output could state
   the persistence/blocking implications more loudly.

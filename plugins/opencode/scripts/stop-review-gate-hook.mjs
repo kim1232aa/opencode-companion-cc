@@ -7,6 +7,7 @@
 import process from "node:process";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
 import { isServerRunning, connect } from "./lib/opencode-server.mjs";
@@ -30,10 +31,12 @@ async function main() {
     return;
   }
 
-  // Read the Claude response from stdin (piped by Claude Code)
-  let claudeResponse = "";
+  // Read the raw stdin the host piped in. Claude Code's Stop hook sends a JSON
+  // object (last_assistant_message / session_id / transcript_path / cwd / …),
+  // NOT the reply text on its own — extractClaudeResponse unwraps it.
+  let rawStdin = "";
   if (!process.stdin.isTTY) {
-    claudeResponse = await new Promise((resolve) => {
+    rawStdin = await new Promise((resolve) => {
       let data = "";
       process.stdin.setEncoding("utf8");
       process.stdin.on("data", (chunk) => (data += chunk));
@@ -42,6 +45,8 @@ async function main() {
       setTimeout(() => resolve(data), 5000);
     });
   }
+
+  const claudeResponse = extractClaudeResponse(rawStdin);
 
   if (!claudeResponse.trim()) {
     console.log("ALLOW: No response to review.");
@@ -82,6 +87,36 @@ async function main() {
   }
 }
 
+/**
+ * Unwrap the Claude reply text from a Stop-hook stdin payload.
+ * Claude Code pipes a JSON object whose reply lives in `last_assistant_message`.
+ * Safe degradation:
+ *   - valid JSON object → its `last_assistant_message` (empty string if the
+ *     field is absent, so the gate simply allows rather than reviewing noise);
+ *   - JSON that isn't an object → "" (nothing meaningful to review);
+ *   - not JSON at all → the raw text verbatim (older/other hosts may pipe the
+ *     reply directly). Never throws — a bad payload must not crash the hook.
+ * @param {string} rawStdin
+ * @returns {string}
+ */
+export function extractClaudeResponse(rawStdin) {
+  const raw = typeof rawStdin === "string" ? rawStdin : "";
+  if (!raw.trim()) return "";
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return typeof parsed.last_assistant_message === "string"
+        ? parsed.last_assistant_message
+        : "";
+    }
+    // Parsed to a bare string ⇒ use it; anything else (number/array/null) ⇒ "".
+    return typeof parsed === "string" ? parsed : "";
+  } catch {
+    // Not JSON — treat the whole stdin as the response text (legacy fallback).
+    return raw;
+  }
+}
+
 function extractText(response) {
   if (typeof response === "string") return response;
   if (response?.parts) {
@@ -93,7 +128,20 @@ function extractText(response) {
   return JSON.stringify(response);
 }
 
-main().catch((err) => {
-  console.log(`ALLOW: Unhandled error: ${err.message}`);
-  process.exit(0);
-});
+// Only run when invoked as the entry script, so tests can import
+// extractClaudeResponse without triggering the full hook (stdin read, git, …).
+function isEntryPoint() {
+  try {
+    return !!process.argv[1] &&
+      fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
+  main().catch((err) => {
+    console.log(`ALLOW: Unhandled error: ${err.message}`);
+    process.exit(0);
+  });
+}
