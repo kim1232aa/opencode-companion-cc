@@ -6,7 +6,10 @@ import { spawn } from "node:child_process";
 import http from "node:http";
 import https from "node:https";
 
-const DEFAULT_PORT = 4096;
+// Read the port from the same env var the CLI's defaultServerUrl() uses, so
+// dispatch (connect/ensureServer) and recovery/cancel probes always agree on
+// which port the server lives on.
+const DEFAULT_PORT = Number(process.env.OPENCODE_SERVER_PORT) || 4096;
 const DEFAULT_HOST = "127.0.0.1";
 const SERVER_START_TIMEOUT = 30_000;
 
@@ -104,11 +107,14 @@ export async function isServerRunning(host = DEFAULT_HOST, port = DEFAULT_PORT) 
     });
     if (!res.ok) return false;
     // Identity check: a foreign service squatting on the port could also answer
-    // 200 here. OpenCode's /global/health returns { healthy, version } — require
-    // that shape so we never treat an unrelated server as our OpenCode and then
-    // dispatch sessions into it.
+    // 200 here. OpenCode's /global/health returns { healthy: true, version }.
+    // Require healthy === true (so a { healthy: false } server isn't treated as
+    // ready), tolerating a version-only body for builds that omit `healthy`, and
+    // fail closed on a non-JSON / unrecognized body so we never dispatch into an
+    // unrelated service.
     const body = await res.json().catch(() => null);
-    return !!body && (typeof body.healthy === "boolean" || typeof body.version === "string");
+    if (!body || typeof body !== "object") return false;
+    return body.healthy === true || (body.healthy == null && typeof body.version === "string");
   } catch {
     return false;
   }
@@ -392,31 +398,62 @@ export function createClient(baseUrl, opts = {}) {
     },
 
     /**
-     * Recover a session's final answer directly from the server. Used to salvage
-     * the result of a job whose worker died AFTER the prompt was sent but the
-     * OpenCode session kept running and finished server-side. Returns the last
-     * assistant message's text, or null if unavailable/empty.
+     * Probe a session's final answer directly from the server, to salvage the
+     * result of a job whose worker died AFTER the prompt was sent but the
+     * OpenCode session kept running server-side.
+     *
+     * Returns { text, active }:
+     *  - text:   the latest COMPLETED, error-free assistant turn (time.completed
+     *            set, info.error absent) that is newer than opts.since — or null.
+     *  - active: true if the server still appears to be generating our answer
+     *            (an in-progress assistant turn, or a trailing user message with
+     *            no completed reply yet). Lets the caller keep waiting instead of
+     *            failing the job or recovering a half-finished turn.
+     *
+     * opts.since (epoch ms) filters out turns from before this task was
+     * dispatched — critical for a reused --resume-last session that still
+     * carries the previous task's answer. opts.timeoutMs bounds the fetch.
      * @param {string} sessionId
-     * @returns {Promise<string|null>}
+     * @param {{ since?: number, timeoutMs?: number }} [opts]
+     * @returns {Promise<{ text: string|null, active: boolean }>}
      */
-    getSessionResult: async (sessionId) => {
+    getSessionResult: async (sessionId, opts = {}) => {
+      const since = typeof opts.since === "number" && opts.since > 0 ? opts.since : 0;
+      const timeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : 300_000;
       try {
-        const msgs = await request("GET", `/session/${sessionId}/message`);
+        const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
         const list = Array.isArray(msgs) ? msgs : [];
-        let lastText = "";
+        let doneText = null;
+        let active = false;
         for (const m of list) {
-          if (m?.info?.role !== "assistant") continue;
+          const info = m?.info;
+          if (!info || info.role !== "assistant") continue;
+          const created = info.time?.created ?? 0;
+          if (since && created && created < since) continue; // pre-dispatch turn
           const parts = Array.isArray(m.parts) ? m.parts : [];
           const text = parts
             .filter((p) => p?.type === "text")
             .map((p) => p.text)
+            .filter(Boolean) // a text part missing .text must not become "undefined"
             .join("\n")
             .trim();
-          if (text) lastText = text; // keep the latest non-empty assistant turn
+          const completed = !!info.time?.completed;
+          const errored = info.error != null;
+          if (completed && !errored && text) {
+            doneText = text; // keep the latest completed, error-free turn
+          } else if (!completed && !errored) {
+            active = true; // an in-progress turn ⇒ the server is still generating
+          }
         }
-        return lastText || null;
+        if (!doneText && !active) {
+          // A trailing user message newer than `since` with no answer yet also
+          // means the server is still working on our prompt.
+          const last = list[list.length - 1]?.info;
+          if (last?.role === "user" && (!since || (last.time?.created ?? 0) >= since)) active = true;
+        }
+        return { text: doneText, active };
       } catch {
-        return null;
+        return { text: null, active: false };
       }
     },
 

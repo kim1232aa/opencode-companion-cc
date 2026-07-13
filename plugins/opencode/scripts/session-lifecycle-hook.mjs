@@ -7,6 +7,12 @@ import process from "node:process";
 import { isServerRunning } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
+import { recoverStrandedResults, reconcileStrandedJobs } from "./lib/job-control.mjs";
+
+function serverUrl() {
+  const port = Number(process.env.OPENCODE_SERVER_PORT) || 4096;
+  return `http://127.0.0.1:${port}`;
+}
 
 const event = process.argv[2]; // "SessionStart" or "SessionEnd"
 
@@ -22,27 +28,17 @@ async function main() {
   }
 
   if (event === "SessionEnd") {
-    // Clean up: check for any orphaned running jobs and mark them as failed
-    const state = loadState(workspace);
-    const runningJobs = (state.jobs ?? []).filter((j) => j.status === "running");
-
-    for (const job of runningJobs) {
-      if (job.pid) {
-        try {
-          // Check if process is still alive
-          process.kill(job.pid, 0);
-        } catch {
-          // Process is gone, mark job as failed
-          const { upsertJob } = await import("./lib/state.mjs");
-          upsertJob(workspace, {
-            id: job.id,
-            status: "failed",
-            completedAt: new Date().toISOString(),
-            errorMessage: "Session ended while job was running",
-          });
-        }
-      }
+    // Clean up orphaned jobs whose worker died. First try to salvage the result
+    // from the server (the session often finished server-side) — otherwise a
+    // recoverable answer would be lost the moment we mark the job failed. Only
+    // then reconcile whatever couldn't be recovered.
+    let jobs = loadState(workspace).jobs ?? [];
+    try {
+      jobs = await recoverStrandedResults(workspace, jobs, serverUrl());
+    } catch {
+      // Recovery is best-effort; fall through to reconciliation.
     }
+    reconcileStrandedJobs(workspace, jobs);
   }
 }
 

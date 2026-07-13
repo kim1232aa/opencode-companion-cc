@@ -29,6 +29,23 @@ describe("reconcileStrandedJobs", () => {
     const out = reconcileStrandedJobs(w, loadState(w).jobs);
     assert.equal(out.find((j) => j.id === "task-done").status, "completed");
   });
+
+  it("keeps a recently-flagged awaitingServer job running despite a dead pid", () => {
+    const w = ws();
+    // Worker gone but recoverStrandedResults saw the session still generating.
+    upsertJob(w, { id: "task-await", type: "task", status: "running", pid: 999999999, awaitingServer: true });
+    const out = reconcileStrandedJobs(w, loadState(w).jobs);
+    assert.equal(out.find((j) => j.id === "task-await").status, "running");
+  });
+
+  it("fails an awaitingServer job once it exceeds the wait bound", () => {
+    const w = ws();
+    upsertJob(w, { id: "task-await-old", type: "task", status: "running", pid: 999999999, awaitingServer: true });
+    // Backdate createdAt past the 45-minute bound (a wedged server can't hold it forever).
+    upsertJob(w, { id: "task-await-old", createdAt: new Date(Date.now() - 60 * 60000).toISOString() });
+    const out = reconcileStrandedJobs(w, loadState(w).jobs);
+    assert.equal(out.find((j) => j.id === "task-await-old").status, "failed");
+  });
 });
 
 describe("resolveResultJob / resolveCancelableJob session scoping", () => {

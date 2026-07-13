@@ -35,6 +35,17 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
 - **No hard per-job wall-clock timeout in `runTrackedJob`.** In practice covered
   by `httpPostJson`'s prompt timeout (`OPENCODE_COMPANION_PROMPT_TIMEOUT_MS`,
   default 30 min), `wait-and-result`'s own bound, and dead-pid reconciliation.
+- **Narrow unrecoverable window at session creation (2.0.3).** If a worker is
+  killed in the split second between `createSession` succeeding and the job
+  record being updated with the `opencodeSessionId`, server-side recovery can't
+  find the orphaned session (state has no id to probe). The window is one line
+  wide; the job still reconciles to `failed`.
+- **Recovery finalize is not transactional (2.0.3).** `recoverStrandedResults`
+  writes the result data file, then flips job state to `completed`. A crash
+  between the two leaves an orphan result file with the job still `running`; a
+  later probe re-recovers it if the server still has the session, otherwise it
+  reconciles to `failed`. Low-probability (tiny window) and self-correcting on
+  the next successful probe.
 
 ## Platform / scope
 

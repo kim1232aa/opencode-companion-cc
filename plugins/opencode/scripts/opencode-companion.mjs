@@ -483,11 +483,19 @@ async function handleWaitAndResult(argv) {
     if (!st) continue;
     if (printTerminal(st)) return;
 
-    // Fail fast if the detached worker died without writing a terminal status.
-    // Ownership-aware: a recycled pid (different start-time) counts as gone.
+    // The detached worker died without writing a terminal status. Before giving
+    // up, try to salvage the result from the server — the session often finished
+    // there. Ownership-aware: a recycled pid (different start-time) counts as gone.
     if (st.pid && !isOwnedProcessAlive(st.pid, st.pidStart)) {
-      const again = loadState(workspace).jobs?.find((j) => j.id === job.id);
+      const healed = await recoverStrandedResults(
+        workspace,
+        loadState(workspace).jobs ?? [],
+        defaultServerUrl()
+      );
+      const again = healed.find((j) => j.id === job.id);
       if (again && printTerminal(again)) return;
+      // Server still generating our answer ⇒ keep waiting instead of failing.
+      if (again?.awaitingServer) continue;
       console.error(`Task ${job.id} worker (pid ${st.pid}) exited without completing.`);
       process.exit(1);
     }

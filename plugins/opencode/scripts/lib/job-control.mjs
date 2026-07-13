@@ -2,7 +2,13 @@
 
 import { tailLines, pidStartTime, writeJson } from "./fs.mjs";
 import { jobLogPath, jobDataPath, upsertJob, loadState } from "./state.mjs";
-import { createClient } from "./opencode-server.mjs";
+import { createClient, isServerRunning } from "./opencode-server.mjs";
+
+const RECOVERY_PROBE_TIMEOUT_MS = 8_000;
+// How long a worker-dead job may wait for the server to finish generating before
+// we stop keeping it alive and let it fail (guards against a wedged server).
+const AWAIT_SERVER_MAX_MS = 45 * 60_000;
+const DEFAULT_HOST_FALLBACK = "127.0.0.1";
 
 // pidStartTime lives in fs.mjs (the lowest-level module, so the file lock can
 // use it too); re-export it here to keep existing importers working.
@@ -56,6 +62,14 @@ export function reconcileStrandedJobs(workspacePath, jobs) {
   for (const j of jobs ?? []) {
     const terminal = j.status === "completed" || j.status === "failed" || j.status === "canceled";
     if (terminal) continue;
+
+    // recoverStrandedResults flagged this job as still generating server-side
+    // (worker dead, session busy). Don't fail it — a later poll will recover the
+    // result — unless it has waited past the bound (a wedged server).
+    if (j.awaitingServer) {
+      const started = new Date(j.createdAt || 0).getTime();
+      if (Number.isFinite(started) && now - started < AWAIT_SERVER_MAX_MS) continue;
+    }
 
     let reason = null;
     if (j.pid) {
@@ -111,35 +125,57 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
   });
   if (!candidates.length) return jobs;
 
+  // One quick health check up front — if the server is gone there is nothing to
+  // recover, and we avoid per-candidate connection stalls.
+  let host = DEFAULT_HOST_FALLBACK;
+  let port;
+  try {
+    const u = new URL(serverUrl);
+    host = u.hostname;
+    port = Number(u.port) || undefined;
+  } catch {
+    /* use isServerRunning defaults */
+  }
+  if (!(await isServerRunning(host, port))) return jobs;
+
   const client = createClient(serverUrl);
-  let changed = false;
   for (const j of candidates) {
-    let text = null;
-    let usage = null;
+    const since = Date.parse(j.createdAt || "") || 0;
+    let probe = { text: null, active: false };
     try {
-      text = await client.getSessionResult(j.opencodeSessionId);
-      if (text) usage = await client.getSessionUsage(j.opencodeSessionId).catch(() => null);
+      probe = await client.getSessionResult(j.opencodeSessionId, {
+        since,
+        timeoutMs: RECOVERY_PROBE_TIMEOUT_MS,
+      });
     } catch {
-      text = null;
+      probe = { text: null, active: false };
     }
-    if (text) {
+    if (probe.text) {
+      const usage = await client.getSessionUsage(j.opencodeSessionId).catch(() => null);
       writeJson(jobDataPath(workspacePath, j.id), {
-        rendered: text,
+        rendered: probe.text,
         usage,
         recovered: true,
-        summary: text.slice(0, 500),
+        summary: probe.text.slice(0, 500),
       });
       upsertJob(workspacePath, {
         id: j.id,
         status: "completed",
         completedAt: new Date().toISOString(),
-        result: text.slice(0, 500),
+        result: probe.text.slice(0, 500),
         recovered: true,
+        awaitingServer: false,
       });
-      changed = true;
+    } else if (probe.active) {
+      // Worker is gone but the server is still generating our answer — keep the
+      // job alive so a later poll can recover it instead of failing it now.
+      upsertJob(workspacePath, { id: j.id, awaitingServer: true });
     }
+    // else (empty): leave it for reconcileStrandedJobs to mark failed.
   }
-  return changed ? (loadState(workspacePath).jobs ?? jobs) : jobs;
+  // Always reload so the caller and the subsequent reconcile see fresh state
+  // (a concurrent worker may also have finalized a job while we probed).
+  return loadState(workspacePath).jobs ?? jobs;
 }
 
 /**

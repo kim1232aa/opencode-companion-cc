@@ -45,9 +45,14 @@ escalation in runCommand; and lenient numeric-string parsing of session cost.
 
 Additional modifications in v2.0.3: server-side result recovery for a worker
 that died after dispatch (getSessionResult / recoverStrandedResults, run by
-status and result before reconciliation); an identity check so a foreign
-service on the port is not mistaken for the OpenCode server; and a stderr job-id
-line plus foreground-blocking dispatch rules so a cut-off wrapper call can still
-recover the result instead of losing it.
+status, result, the SessionEnd hook, and wait-and-result before reconciliation),
+gated on turn completion / no-error / dispatch-time so a half-finished, errored,
+or reused-session answer is never recovered, with a still-generating session
+kept alive instead of failed; an identity check (healthy === true) so a foreign
+service on the port is not mistaken for the OpenCode server; a unified server
+port across dispatch and recovery; and a stderr job-id line plus foreground-
+blocking dispatch rules so a cut-off wrapper call can still recover the result
+instead of losing it. The recovery hardening was driven by an adversarial
+review from Codex and GLM 5.2.
 
 Licensed under the Apache License, Version 2.0. See the LICENSE file.
