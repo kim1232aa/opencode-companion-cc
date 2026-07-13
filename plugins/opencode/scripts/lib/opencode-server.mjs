@@ -177,12 +177,15 @@ export async function ensureServer(opts = {}) {
  * @param {string} modelRef
  * @returns {{ providerID: string, modelID: string }}
  */
-function parseModelRef(modelRef) {
-  const idx = modelRef.indexOf("/");
-  if (idx === -1) {
+export function parseModelRef(modelRef) {
+  const ref = String(modelRef).trim();
+  const idx = ref.indexOf("/");
+  const providerID = idx === -1 ? "" : ref.slice(0, idx);
+  const modelID = idx === -1 ? "" : ref.slice(idx + 1);
+  if (!providerID || !modelID) {
     throw new Error(`--model must be in the form provider/model, got: ${modelRef}`);
   }
-  return { providerID: modelRef.slice(0, idx), modelID: modelRef.slice(idx + 1) };
+  return { providerID, modelID };
 }
 
 const PERMISSION_POLL_INTERVAL_MS = 3000;
@@ -216,20 +219,32 @@ function watchAndRejectPermissions(baseUrl, headers, sessionId) {
           signal: AbortSignal.timeout(5000),
         });
         if (res.ok) {
-          const pending = await res.json();
+          const raw = await res.json();
+          const pending = Array.isArray(raw) ? raw : (raw?.permissions ?? []);
           for (const p of pending) {
             if (p.sessionID !== sessionId || handled.has(p.id)) continue;
-            handled.add(p.id);
             const patterns = Array.isArray(p.patterns) ? p.patterns.join(", ") : "";
-            await fetch(`${baseUrl}/permission/${p.id}/reply`, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
-                reply: "reject",
-                message: `Auto-rejected by opencode-companion: this is a headless dispatch with no one able to approve a "${p.permission}" prompt${patterns ? ` (${patterns})` : ""}.`,
-              }),
-              signal: AbortSignal.timeout(5000),
-            }).catch(() => {});
+            try {
+              const reply = await fetch(`${baseUrl}/permission/${p.id}/reply`, {
+                method: "POST",
+                headers,
+                body: JSON.stringify({
+                  reply: "reject",
+                  message: `Auto-rejected by opencode-companion: this is a headless dispatch with no one able to approve a "${p.permission}" prompt${patterns ? ` (${patterns})` : ""}.`,
+                }),
+                signal: AbortSignal.timeout(5000),
+              });
+              // Only mark handled once the reject is accepted (or terminally
+              // 4xx = already resolved). A transient 5xx/network failure leaves
+              // it unhandled so the next poll retries instead of stranding it.
+              if (reply.ok || (reply.status >= 400 && reply.status < 500)) {
+                handled.add(p.id);
+              } else {
+                process.stderr.write(`[opencode-companion] permission reject for ${p.id} got HTTP ${reply.status}; will retry\n`);
+              }
+            } catch (err) {
+              process.stderr.write(`[opencode-companion] permission reject for ${p.id} failed (${err.message}); will retry\n`);
+            }
           }
         }
       } catch {
@@ -254,7 +269,12 @@ export function createClient(baseUrl, opts = {}) {
     "Content-Type": "application/json",
   };
   if (opts.directory) {
-    headers["x-opencode-directory"] = opts.directory;
+    // Header values must be ASCII; a workspace path with non-ASCII chars
+    // (e.g. a Chinese directory name) would make Headers/undici throw and
+    // crash every request. Percent-encode only when needed.
+    headers["x-opencode-directory"] = /[^\x00-\x7F]/.test(opts.directory)
+      ? encodeURIComponent(opts.directory)
+      : opts.directory;
   }
   if (process.env.OPENCODE_SERVER_PASSWORD) {
     const user = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
