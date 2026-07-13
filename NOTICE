@@ -1,0 +1,31 @@
+opencode-companion-cc
+Copyright 2026 kim1232aa and contributors
+
+This product includes software originally developed as part of:
+
+  - codex-plugin-cc (https://github.com/openai/codex-plugin-cc) by OpenAI
+    — the original plugin architecture, command patterns, and skill structure.
+
+  - opencode-plugin-cc (https://github.com/tasict/opencode-plugin-cc) by tasict
+    — the OpenCode adaptation this project is directly forked from.
+
+Portions of the hardening and fixes in this distribution were harvested from
+the following forks (Apache License 2.0), with thanks:
+
+  - suharvest/opencode-plugin-cc — background-job self-heal, race-condition
+    fixes, state-dir isolation, and the recursive-delegation safety header.
+
+  - JohnnyVicious/opencode-plugin-cc — the node:http workaround for undici's
+    hidden body timeout, review-handler --model threading, and fixes ported
+    from openai/codex-plugin-cc.
+
+Modifications made in this fork (per Apache License 2.0, Section 4(b)) include,
+among others: routing the model field as a {providerID, modelID} object for
+current OpenCode REST versions; a node:http prompt transport that bypasses
+undici's 300s body timeout; automatic rejection of un-answerable permission
+prompts in headless dispatch; a filesystem lock around job-state writes;
+correct read-only derivation from --agent plan; provider-list parsing for the
+{all, default, connected} response shape; verbatim prompt forwarding; and an
+expanded test suite covering the previously-untested modules.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
