@@ -137,8 +137,8 @@ export function renderReview(review) {
         lines.push(`- **Confidence**: n/a`);
       }
       
-      lines.push(`- ${f.body}`);
-      lines.push(`- **Recommendation**: ${f.recommendation}`);
+      if (f.body) lines.push(`- ${f.body}`);
+      if (f.recommendation) lines.push(`- **Recommendation**: ${f.recommendation}`);
       lines.push("");
     }
   } else {
