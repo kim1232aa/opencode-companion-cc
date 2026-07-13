@@ -1,38 +1,65 @@
 ---
 name: opencode-prompting
-description: Best practices for crafting effective prompts when delegating tasks to OpenCode
+description: OpenCode-specific rules for composing the task text forwarded to the opencode-companion runtime — what the dispatch layer already handles for you, what breaks a forwarded prompt, and how model/agent selection actually behaves. Use when writing or reviewing the task text for an /opencode:rescue delegation, choosing between the build and plan agents, or picking a --model for a delegated OpenCode run.
 user-invocable: false
 ---
 
-# OpenCode Prompting Guide
+# OpenCode Prompting
 
-Use this skill to shape prompts before forwarding to the OpenCode companion runtime.
+Rules grounded in how this plugin's dispatch layer actually behaves — not
+generic prompt advice.
 
-## Prompt Structure
+## What the dispatch layer already does (don't duplicate it)
 
-A good OpenCode task prompt should:
-1. **State the goal clearly** -- What should be accomplished?
-2. **Provide context** -- What files, functions, or systems are involved?
-3. **Define success criteria** -- How do we know it's done?
-4. **Set constraints** -- What should NOT be changed?
+- **A SAFETY_HEADER is prepended to every task prompt** (`prompts.mjs`). It
+  tells the model it is running INSIDE an OpenCode session and neutralizes any
+  Claude Code routing rules that leaked in from CLAUDE.md ("delegate to
+  opencode-rescue / codex-rescue", `plugin:name` Task invocations). You do not
+  need to strip such rules from the task text — but also never ADD delegation
+  instructions of your own: a model that tries to re-delegate stalls (GLM
+  notoriously hangs after a failed Task call).
+- **A read/write preamble is added** based on the agent: write runs get "You
+  have full read/write access", plan runs get "This is a read-only
+  investigation. Do not modify any files."
 
-## Agent Selection
+## What actually breaks a forwarded prompt
 
-OpenCode has two primary agents:
-- **build** (default): Full read/write access, can execute commands, edit files, and make changes
-- **plan**: Read-only analysis mode, good for investigation and architecture planning
+- **Routing flags mixed into prose.** Declared flags (`--model`, `--agent`,
+  `--write`, `--worktree`, `--resume-last`, `--fresh`, `--background`,
+  `--wait`) are stripped from the task text wherever they appear — so never
+  write a sentence like "run this with --worktree" and expect the words to
+  survive. Undeclared `--tokens` (e.g. "run git commit --no-verify") ARE kept
+  as task text.
+- **Relying on conversation context.** The OpenCode model sees ONLY the task
+  text + the repo it runs in. Anything discussed in the Claude session
+  (decisions, constraints, file lists) must be restated in the task text —
+  forward it byte-for-byte and complete; length is not a problem, missing
+  context is.
 
-## Best Practices
+## Agent selection (the real semantics)
 
-- Be specific about file paths and function names when possible
-- Include error messages or test failures verbatim
-- Specify the programming language and framework context
-- If debugging, include reproduction steps
-- For refactoring, describe the desired end state
+- `build` (default): full write access. `--write` is NOT a real switch — write
+  capability comes from the agent, nothing else.
+- `plan`: the ONLY way to get a read-only run. Reviews always use it.
+- Do not infer read-only from investigative wording ("diagnose", "research");
+  such tasks often precede a fix. Only explicit user intent ("review only",
+  "don't change anything") selects `plan`.
 
-## Anti-patterns
+## Model selection
 
-- Do not ask OpenCode to "fix everything" without specifics
-- Do not include irrelevant context that dilutes the prompt
-- Do not ask for multiple unrelated tasks in one prompt
-- Do not assume OpenCode knows your project's conventions without telling it
+- `--model` must be `provider/model`, split on the FIRST slash — model ids may
+  themselves contain slashes (e.g. `volcano-coding/火山方舟Coding_Plan/glm-5.2`
+  is provider `volcano-coding`, model `火山方舟Coding_Plan/glm-5.2`).
+- Omit `--model` to use the provider default. Only pass one the user asked for;
+  a bad ref fails the dispatch with "--model must be in the form
+  provider/model".
+
+## Shaping the task itself
+
+- One task per dispatch. The companion tracks one job per invocation; bundled
+  unrelated asks produce one blended, hard-to-recover result.
+- State the goal, the involved paths, and the success criteria in the text.
+  OpenCode agents can read the repo themselves — name the entry points instead
+  of pasting whole files.
+- For write tasks on a repo that others may be editing concurrently, request
+  isolation via `--worktree` (a flag, not prose).

@@ -56,8 +56,9 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
 
   const add = await git(top, ["worktree", "add", "--detach", wtPath, "HEAD"]);
   if (add.exitCode !== 0) {
-    log(`--worktree setup failed (${add.stderr.trim()}); running in the live workspace instead.`);
-    return fn(dir);
+    // The caller EXPLICITLY asked for isolation; silently running in the live
+    // workspace would defeat exactly what --worktree exists to prevent. Fail.
+    throw new Error(`--worktree setup failed: ${add.stderr.trim() || "git worktree add failed"}. Not falling back to the live workspace (isolation was explicitly requested).`);
   }
 
   // If `dir` was a subdirectory of the repo, run the task in the matching
@@ -70,7 +71,17 @@ export async function withWorktree({ dir, jobId, useWorktree, isWrite }, fn, log
   let patchFile = null;
   let keepWorktree = false;
   try {
-    const result = await fn(effectiveCwd);
+    let result;
+    try {
+      result = await fn(effectiveCwd);
+    } catch (err) {
+      // The task itself failed (HTTP timeout, API error, …) AFTER it may have
+      // already modified files in the worktree. Removing the worktree now would
+      // silently destroy those changes — keep it and point the user at it.
+      keepWorktree = true;
+      log(`Task failed inside the isolated worktree; its partial changes are preserved at ${wtPath}.`);
+      throw err;
+    }
 
     // Capture everything the task changed in the worktree as one patch.
     // Check exit codes: a failed add/diff (index.lock, disk full, corrupt repo)

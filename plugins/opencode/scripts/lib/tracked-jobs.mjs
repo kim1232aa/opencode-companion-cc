@@ -83,7 +83,7 @@ export async function runTrackedJob(workspacePath, job, runner) {
     // Write result data file
     const dataFile = jobDataPath(workspacePath, job.id);
     ensureDir(path.dirname(dataFile));
-    fs.writeFileSync(dataFile, JSON.stringify(result, null, 2), "utf8");
+    fs.writeFileSync(dataFile, JSON.stringify(result, null, 2), { encoding: "utf8", mode: 0o600 });
 
     report("completed", `Job ${job.id} completed`);
     return result;

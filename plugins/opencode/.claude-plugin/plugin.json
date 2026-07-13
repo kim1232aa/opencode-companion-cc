@@ -1,6 +1,6 @@
 {
   "name": "opencode",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "Delegate coding tasks to OpenCode (any OpenAI-compatible backend) or run code reviews, from inside Claude Code.",
   "author": {
     "name": "kim1232aa"

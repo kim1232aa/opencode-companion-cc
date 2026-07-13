@@ -74,10 +74,16 @@ export async function getOpencodeVersion() {
  */
 export function runCommand(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
+    // detached: run the child in its OWN process group (POSIX) so timeout /
+    // overflow kills can signal the WHOLE group (-pid). Killing only the direct
+    // child leaves grandchildren (e.g. `sh -c "sleep 100"`) holding the output
+    // pipes, and `close` never fires — wedging the caller open.
+    const useGroup = process.platform !== "win32";
     const proc = spawn(cmd, args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
+      detached: useGroup,
     });
     let stdout = "";
     let stderr = "";
@@ -95,21 +101,20 @@ export function runCommand(cmd, args, opts = {}) {
 
     let killTimer = null;
     let graceTimer = null;
-    // SIGTERM, then SIGKILL after a short grace — so a child that ignores
-    // SIGTERM (or leaves grandchildren holding the pipe) can't wedge us open.
-    const escalateKill = () => {
+    // Signal the whole process group when we own one, else just the child.
+    const signalTree = (sig) => {
       try {
-        proc.kill("SIGTERM");
+        if (useGroup && proc.pid) process.kill(-proc.pid, sig);
+        else proc.kill(sig);
       } catch {
         /* already gone */
       }
-      graceTimer = setTimeout(() => {
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      }, 2000);
+    };
+    // SIGTERM, then SIGKILL after a short grace — so a child that ignores
+    // SIGTERM (or leaves grandchildren holding the pipe) can't wedge us open.
+    const escalateKill = () => {
+      signalTree("SIGTERM");
+      graceTimer = setTimeout(() => signalTree("SIGKILL"), 2000);
       graceTimer.unref?.();
     };
 

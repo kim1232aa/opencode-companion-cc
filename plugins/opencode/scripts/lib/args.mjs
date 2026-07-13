@@ -89,15 +89,23 @@ export function extractTaskText(argv, flagsWithValue = [], booleanFlags = []) {
       const eqIdx = key.indexOf("=");
       if (eqIdx !== -1) {
         key = key.slice(0, eqIdx);
-        // inline value form: no next token to consume
-      } else if (valSet.has(key)) {
+        if (valSet.has(key) || boolSet.has(key)) continue; // known inline flag
+        parts.push(arg); // unknown --foo=bar is task text — keep it
+        continue;
+      }
+      if (valSet.has(key)) {
         // Mirror parseArgs: only consume the next token as this flag's value
         // when it isn't itself an option, so a stray `--model --write` doesn't
         // eat --write and mis-split the remaining task text.
         const next = argv[i + 1];
         if (next !== undefined && !next.startsWith("--")) i++;
+        continue;
       }
-      // skip boolean flags silently
+      if (boolSet.has(key)) continue; // known boolean routing flag
+      // NOT a declared flag: it's part of the task text (e.g. "run git commit
+      // --no-verify"). Stripping it would silently corrupt the forwarded task
+      // and break the byte-for-byte forwarding promise.
+      parts.push(arg);
       continue;
     }
     parts.push(arg);

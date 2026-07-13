@@ -31,11 +31,21 @@ is a trap:
   continuously. A long gap sitting at `Running task…` is the **normal working
   state**, not a sign of death.
 
+## Jobs are session-scoped by default
+
+`status` and `result` (without an explicit job id) show ONLY jobs dispatched
+from the current Claude session — another session's newer job is deliberately
+not returned. To inspect a different session's job, pass its job id explicitly.
+So "result says no finished job" does not mean the workspace has none.
+
 ## "Frozen" is not "dead"
 
 A stale log does not mean the worker died. A real OpenCode task routinely runs
 **15–30+ minutes**. Do not declare a task dead because it has been quiet for a
-few minutes.
+few minutes. While the model is generating, the worker writes a
+`heartbeat: N tokens so far` line into the job log every ~30s — `status` shows
+it in the running job's progress preview. Tokens climbing between two `status`
+calls = working; frozen across several = genuinely stuck.
 
 - Determine liveness from the **worker process and the server**, not from log
   recency. `status` already does this (it reconciles a dead pid to `failed` and
@@ -57,7 +67,9 @@ When you have the command output:
 
 1. Return the command's stdout as the primary result — the final assistant
    message, any changed files, and the trailing token/cost line.
-2. Note when a result is `recovered` (it came from the server after the worker
-   exited, so double-check it looks complete).
+2. A recovered result is marked by the exact line
+   `> Recovered from the OpenCode server after the worker exited without returning.`
+   in the `result` output — when you see it, mention the recovery and
+   double-check the answer looks complete.
 3. Include the session id so the run can be resumed (`--resume-last`, or an
    explicit resume of that session).

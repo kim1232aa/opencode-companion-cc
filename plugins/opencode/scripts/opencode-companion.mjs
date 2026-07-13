@@ -275,7 +275,7 @@ async function handleTask(argv) {
 
   // Check for resume
   let resumeSessionId = null;
-  if (options["resume-last"]) {
+  if (options["resume-last"] && !options.fresh) { // --fresh explicitly overrides --resume-last
     const state = loadState(workspace);
     const sessionId = getClaudeSessionId();
     const lastTask = state.jobs
@@ -315,7 +315,7 @@ async function handleTask(argv) {
       console.error(`OpenCode task ${job.id}: ${msg}`);
       process.exit(1);
     }
-    upsertJob(workspace, { id: job.id, pid: bgChild.pid, pidStart: pidStartTime(bgChild.pid) });
+    upsertJob(workspace, { id: job.id, pid: bgChild.pid, pidStart: pidStartTime(bgChild.pid), detachedWorker: true });
     console.log(`OpenCode task started in background: ${job.id}`);
     console.log("Check `/opencode:status` for progress.");
     return;
@@ -344,10 +344,27 @@ async function handleTask(argv) {
         report("investigating", "Sending task to OpenCode...");
         log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${options.model ?? "(provider default)"}`);
 
-        const response = await client.sendPrompt(sessionId, prompt, {
-          agent: agentName,
-          model: options.model,
-        });
+        // Same token-progress heartbeat as the background worker: lets `status`
+        // (from another window) distinguish "generating" from "stuck".
+        const heartbeat = setInterval(async () => {
+          const u = await client
+            .getSessionUsage(sessionId, { timeoutMs: 8_000 })
+            .catch(() => null);
+          if (u && u.total > 0) {
+            log(`heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`);
+          }
+        }, 30_000);
+        heartbeat.unref?.();
+
+        let response;
+        try {
+          response = await client.sendPrompt(sessionId, prompt, {
+            agent: agentName,
+            model: options.model,
+          });
+        } finally {
+          clearInterval(heartbeat);
+        }
 
         report("finalizing", "Processing task output...");
 
@@ -413,7 +430,7 @@ async function handleWaitAndResult(argv) {
   const useWorktree = !!options.worktree;
 
   let resumeSessionId = null;
-  if (options["resume-last"]) {
+  if (options["resume-last"] && !options.fresh) { // --fresh explicitly overrides --resume-last
     const state = loadState(workspace);
     const sid = getClaudeSessionId();
     const lastTask = state.jobs
@@ -448,7 +465,7 @@ async function handleWaitAndResult(argv) {
     console.error(`Task ${job.id}: ${msg}`);
     process.exit(1);
   }
-  upsertJob(workspace, { id: job.id, pid: child.pid, pidStart: pidStartTime(child.pid) });
+  upsertJob(workspace, { id: job.id, pid: child.pid, pidStart: pidStartTime(child.pid), detachedWorker: true });
 
   // Announce the job id on stderr up front. This is a blocking call: the full
   // result prints to stdout when the worker finishes. But if the wrapper's Bash
@@ -546,10 +563,30 @@ async function handleTaskWorker(argv) {
         const prompt = buildTaskPrompt(taskText, { write: isWrite });
         report("investigating", "Running task...");
 
-        const response = await client.sendPrompt(sessionId, prompt, {
-          agent: agentName,
-          model: options.model,
-        });
+        // Heartbeat: while sendPrompt blocks (often 15-30+ min), poll the
+        // server's live token count into the job log every 30s. `status` shows
+        // the log tail, so a user can tell "still generating" (tokens climbing)
+        // from "actually stuck" (frozen across polls) — the job log otherwise
+        // only changes on phase transitions.
+        const heartbeat = setInterval(async () => {
+          const u = await client
+            .getSessionUsage(sessionId, { timeoutMs: 8_000 })
+            .catch(() => null);
+          if (u && u.total > 0) {
+            log(`heartbeat: ${u.total.toLocaleString()} tokens so far (${u.turns} turn${u.turns === 1 ? "" : "s"})`);
+          }
+        }, 30_000);
+        heartbeat.unref?.();
+
+        let response;
+        try {
+          response = await client.sendPrompt(sessionId, prompt, {
+            agent: agentName,
+            model: options.model,
+          });
+        } finally {
+          clearInterval(heartbeat);
+        }
 
         const text = extractResponseText(response);
         const usage = await client.getSessionUsage(sessionId).catch(() => null);
@@ -688,12 +725,12 @@ async function handleCancel(argv) {
     }
   }
 
-  // Kill the worker only if its pid is still alive AND still the process we
-  // spawned. isOwnedProcessAlive compares the recorded kernel start-time
-  // fingerprint, so a pid recycled by an unrelated process is not signalled.
-  // (When the fingerprint is unavailable — non-Linux — it degrades to a bare
-  // liveness check, matching the old best-effort behavior.)
-  if (job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
+  // Signal ONLY a detached background worker. A foreground job's recorded pid
+  // is the dispatcher process itself (the user's live Bash call) — SIGTERMing
+  // it from another session would kill that call mid-output; abortSession above
+  // already makes its sendPrompt return. Ownership is verified via the kernel
+  // start-time fingerprint so a recycled pid is never signalled.
+  if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
     try {
       process.kill(job.pid, "SIGTERM");
     } catch {
@@ -701,22 +738,28 @@ async function handleCancel(argv) {
     }
   }
 
-  // Re-read the job before overwriting its status: the worker may have finished
-  // (status → completed/failed) during the abortSession HTTP round-trip. Don't
-  // clobber a real terminal result with a misleading "canceled".
-  const fresh = loadState(workspace).jobs?.find((j) => j.id === job.id);
-  if (fresh && fresh.status !== "running" && fresh.status !== "pending") {
-    console.log(`Job ${job.id} already ${fresh.status}; nothing to cancel.`);
-    return;
-  }
-
-  upsertJob(workspace, {
-    id: job.id,
-    status: "canceled",
-    completedAt: new Date().toISOString(),
-    errorMessage: "Canceled by user",
+  // Compare-and-set INSIDE the state lock: the worker may finish (completed/
+  // failed) during the abortSession round-trip, and a check-then-write outside
+  // the lock could still clobber that terminal result with "canceled".
+  let finalStatus = null;
+  updateState(workspace, (state) => {
+    const j = state.jobs?.find((x) => x.id === job.id);
+    if (!j) return;
+    if (j.status !== "running" && j.status !== "pending") {
+      finalStatus = j.status; // already terminal — leave it
+      return;
+    }
+    j.status = "canceled";
+    j.completedAt = new Date().toISOString();
+    j.errorMessage = "Canceled by user";
+    j.updatedAt = new Date().toISOString();
+    finalStatus = "canceled";
   });
 
+  if (finalStatus && finalStatus !== "canceled") {
+    console.log(`Job ${job.id} already ${finalStatus}; nothing to cancel.`);
+    return;
+  }
   console.log(`Canceled job: ${job.id}`);
 }
 
@@ -738,8 +781,9 @@ function extractResponseText(response) {
   // the info.content / stringify fallbacks instead of throwing on `.filter`.
   if (Array.isArray(response.parts)) {
     return response.parts
-      .filter((p) => p.type === "text")
+      .filter((p) => p?.type === "text")
       .map((p) => p.text)
+      .filter(Boolean)
       .join("\n");
   }
 
@@ -748,8 +792,9 @@ function extractResponseText(response) {
     if (typeof response.info.content === "string") return response.info.content;
     if (Array.isArray(response.info.content)) {
       return response.info.content
-        .filter((p) => p.type === "text")
+        .filter((p) => p?.type === "text")
         .map((p) => p.text)
+        .filter(Boolean)
         .join("\n");
     }
   }

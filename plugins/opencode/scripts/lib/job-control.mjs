@@ -65,9 +65,10 @@ export function reconcileStrandedJobs(workspacePath, jobs) {
 
     // recoverStrandedResults flagged this job as still generating server-side
     // (worker dead, session busy). Don't fail it — a later poll will recover the
-    // result — unless it has waited past the bound (a wedged server).
+    // result — unless it has waited past the bound (a wedged server). The bound
+    // measures time since waiting BEGAN (awaitingServerSince), not job age.
     if (j.awaitingServer) {
-      const started = new Date(j.createdAt || 0).getTime();
+      const started = new Date(j.awaitingServerSince || j.createdAt || 0).getTime();
       if (Number.isFinite(started) && now - started < AWAIT_SERVER_MAX_MS) continue;
     }
 
@@ -151,7 +152,9 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
       probe = { text: null, active: false };
     }
     if (probe.text) {
-      const usage = await client.getSessionUsage(j.opencodeSessionId).catch(() => null);
+      const usage = await client
+        .getSessionUsage(j.opencodeSessionId, { timeoutMs: RECOVERY_PROBE_TIMEOUT_MS })
+        .catch(() => null);
       writeJson(jobDataPath(workspacePath, j.id), {
         rendered: probe.text,
         usage,
@@ -169,7 +172,13 @@ export async function recoverStrandedResults(workspacePath, jobs, serverUrl) {
     } else if (probe.active) {
       // Worker is gone but the server is still generating our answer — keep the
       // job alive so a later poll can recover it instead of failing it now.
-      upsertJob(workspacePath, { id: j.id, awaitingServer: true });
+      // Record WHEN waiting began so the reconcile bound measures actual
+      // server-wait time, not total job age.
+      upsertJob(workspacePath, {
+        id: j.id,
+        awaitingServer: true,
+        awaitingServerSince: j.awaitingServerSince ?? new Date().toISOString(),
+      });
     }
     // else (empty): leave it for reconcileStrandedJobs to mark failed.
   }
@@ -300,11 +309,12 @@ export function resolveResultJob(jobs, ref, opts = {}) {
   let pool = jobs.filter(
     (j) => j.status === "completed" || j.status === "failed" || j.status === "canceled"
   );
-  // Without an explicit ref, scope to this Claude session (like status does)
-  // so `result` doesn't silently return another session's newest job.
+  // Without an explicit ref, scope STRICTLY to this Claude session (like status
+  // does). No fallback to the global pool: silently returning another session's
+  // newest job would present a stranger's result as ours. An explicit job id
+  // still reaches any session's job.
   if (!ref && opts.sessionId) {
-    const scoped = pool.filter((j) => j.sessionId === opts.sessionId);
-    if (scoped.length) pool = scoped;
+    pool = pool.filter((j) => j.sessionId === opts.sessionId);
   }
   if (!ref) {
     const sorted = sortJobsNewestFirst(pool);

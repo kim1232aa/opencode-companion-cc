@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "opencode-companion-cc",
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "Maintained, hardened OpenCode delegation + review plugin for Claude Code. Consolidates fixes from tasict, suharvest, and JohnnyVicious plus original bug fixes and expanded tests.",
   "owner": {
     "name": "kim1232aa"
@@ -10,7 +10,7 @@
     {
       "name": "opencode",
       "description": "Delegate coding tasks to OpenCode (any OpenAI-compatible backend) or run code reviews, from inside Claude Code.",
-      "version": "2.0.4",
+      "version": "2.0.5",
       "author": {
         "name": "kim1232aa"
       },

@@ -168,22 +168,38 @@ export async function ensureServer(opts = {}) {
   });
   proc.unref();
 
+  // The stdout/stderr pipes are open handles held by THIS process; proc.unref()
+  // alone does not release them, so after a cold start the dispatcher would
+  // finish its work and then hang forever instead of exiting. Destroy them once
+  // we no longer need startup diagnostics.
+  const releasePipes = () => {
+    try { proc.stdout?.destroy(); } catch { /* already closed */ }
+    try { proc.stderr?.destroy(); } catch { /* already closed */ }
+  };
+
   // Wait for the server to become ready
   const deadline = Date.now() + SERVER_START_TIMEOUT;
   while (Date.now() < deadline) {
     if (spawnError) {
+      releasePipes();
       throw new Error(`Failed to spawn 'opencode serve': ${spawnError.message}`);
     }
     if (earlyExit) {
       const detail = diagTail.trim() ? `\nOutput:\n${diagTail.trim()}` : "";
+      releasePipes();
       throw new Error(`'opencode serve' exited early (code ${earlyExit.code}${earlyExit.signal ? `, signal ${earlyExit.signal}` : ""}) before becoming ready.${detail}`);
     }
     if (await isServerRunning(host, port)) {
+      releasePipes();
       return { url, pid: proc.pid, alreadyRunning: false };
     }
     await new Promise((r) => setTimeout(r, 500));
   }
 
+  // Startup timed out: kill the half-started child so it doesn't linger trying
+  // to bind the port (a later call would then see a confusing "already running").
+  try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+  releasePipes();
   const detail = diagTail.trim() ? `\nLast output:\n${diagTail.trim()}` : "";
   throw new Error(`OpenCode server failed to start within ${SERVER_START_TIMEOUT / 1000}s${detail}`);
 }
@@ -287,10 +303,11 @@ export function createClient(baseUrl, opts = {}) {
     "Content-Type": "application/json",
   };
   if (opts.directory) {
-    // Header values must be ASCII; a workspace path with non-ASCII chars
-    // (e.g. a Chinese directory name) would make Headers/undici throw and
-    // crash every request. Percent-encode only when needed.
-    headers["x-opencode-directory"] = /[^\x00-\x7F]/.test(opts.directory)
+    // Header values must be ASCII AND free of control chars: non-ASCII (e.g. a
+    // Chinese directory name) or a control char (\r\n — a path CAN legally
+    // contain them on Linux) would make Headers/undici throw and crash every
+    // request. Percent-encode when either is present; the server decodes.
+    headers["x-opencode-directory"] = /[^\x20-\x7E]/.test(opts.directory)
       ? encodeURIComponent(opts.directory)
       : opts.directory;
   }
@@ -362,9 +379,10 @@ export function createClient(baseUrl, opts = {}) {
      * Each message's info.tokens is per-turn, so a multi-step agent loop needs
      * them summed for the true session total. Returns null on failure.
      */
-    getSessionUsage: async (sessionId) => {
+    getSessionUsage: async (sessionId, opts = {}) => {
+      const timeoutMs = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : 300_000;
       try {
-        const msgs = await request("GET", `/session/${sessionId}/message`);
+        const msgs = await request("GET", `/session/${sessionId}/message`, undefined, timeoutMs);
         const list = Array.isArray(msgs) ? msgs : [];
         const acc = { total: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
         for (const m of list) {
@@ -429,7 +447,11 @@ export function createClient(baseUrl, opts = {}) {
           const info = m?.info;
           if (!info || info.role !== "assistant") continue;
           const created = info.time?.created ?? 0;
-          if (since && created && created < since) continue; // pre-dispatch turn
+          // When a dispatch-time filter is active, a message with a MISSING
+          // timestamp must be treated as pre-dispatch (skip) — otherwise an old
+          // turn whose backend omitted time.created would slip past the filter
+          // and be recovered as the current task's answer.
+          if (since && (!created || created < since)) continue;
           const parts = Array.isArray(m.parts) ? m.parts : [];
           const text = parts
             .filter((p) => p?.type === "text")
@@ -493,35 +515,19 @@ export function createClient(baseUrl, opts = {}) {
       }
     },
 
-    /**
-     * Send a prompt asynchronously (returns immediately).
-     */
-    sendPromptAsync: (sessionId, promptText, opts = {}) => {
-      const body = {
-        parts: [{ type: "text", text: promptText }],
-      };
-      if (opts.agent) body.agent = opts.agent;
-      if (opts.model) body.model = parseModelRef(opts.model);
-      return request("POST", `/session/${sessionId}/prompt_async`, body);
-    },
-
     // Agents
     listAgents: () => request("GET", "/agent"),
 
     // Providers
     listProviders: () => request("GET", "/provider"),
-    getProviderAuth: () => request("GET", "/provider/auth"),
 
     // Config
     getConfig: () => request("GET", "/config"),
 
-    // Events (SSE) - returns a ReadableStream
-    subscribeEvents: async () => {
-      const res = await fetch(`${baseUrl}/event`, {
-        headers: { ...headers, Accept: "text/event-stream" },
-      });
-      return res.body;
-    },
+    // NOTE: sendPromptAsync / getProviderAuth / subscribeEvents were removed —
+    // they had zero callers and inconsistent option/error handling (e.g. a
+    // silently-ignored `system` option, no res.ok check on the SSE stream),
+    // which made them a false capability surface for future callers.
   };
 }
 

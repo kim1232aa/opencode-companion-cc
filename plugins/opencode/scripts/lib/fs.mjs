@@ -4,11 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 
 /**
- * Ensure a directory exists (recursive mkdir).
+ * Ensure a directory exists (recursive mkdir), private to the current user.
+ * State can land in a shared location (/tmp fallback), and job results/logs may
+ * contain code and review output — 0700 keeps other local users out.
  * @param {string} dirPath
  */
 export function ensureDir(dirPath) {
-  fs.mkdirSync(dirPath, { recursive: true });
+  fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
 }
 
 /**
@@ -32,7 +34,7 @@ export function readJson(filePath) {
 export function writeJson(filePath, data) {
   ensureDir(path.dirname(filePath));
   const tmp = `${filePath}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
   fs.renameSync(tmp, filePath);
 }
 
@@ -43,7 +45,7 @@ export function writeJson(filePath, data) {
  */
 export function appendLine(filePath, line) {
   ensureDir(path.dirname(filePath));
-  fs.appendFileSync(filePath, line + "\n", "utf8");
+  fs.appendFileSync(filePath, line + "\n", { encoding: "utf8", mode: 0o600 });
 }
 
 /**

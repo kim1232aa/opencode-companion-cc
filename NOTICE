@@ -43,6 +43,16 @@ value option never swallows a following flag; git add/diff exit-code checks and
 subdirectory-aware cwd in the worktree round-trip; a total timeout with SIGKILL
 escalation in runCommand; and lenient numeric-string parsing of session cost.
 
+Additional modifications in v2.0.5 (from a three-model adversarial review —
+GLM 5.2, Kimi k2.7, Codex): worktree preservation on task failure and hard
+failure instead of silent isolation fallback; released server-spawn pipes so a
+cold start cannot hang the dispatcher; cancel signals only detached workers and
+finalizes under the state lock; reviews diff against HEAD with validated refs
+and hard git errors; byte-for-byte task text (only declared flags stripped);
+process-group kills; strict session scoping and dispatch-time filtering;
+private state permissions; a live token-progress heartbeat; and removal of a
+dead client API surface.
+
 Additional modifications in v2.0.3: server-side result recovery for a worker
 that died after dispatch (getSessionResult / recoverStrandedResults, run by
 status, result, the SessionEnd hook, and wait-and-result before reconciliation),
