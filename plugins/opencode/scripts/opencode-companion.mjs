@@ -177,7 +177,7 @@ async function handleReview(argv) {
     });
 
     console.log(result.rendered);
-    const usageLine = formatUsage(result.usage);
+    const usageLine = formatUsage(result.usage, { requestedModel: options.model });
     if (usageLine) console.log(`\n---\n${usageLine}`);
   } catch (err) {
     console.error(`Review failed: ${err.message}`);
@@ -237,7 +237,7 @@ async function handleAdversarialReview(argv) {
     });
 
     console.log(result.rendered);
-    const usageLine = formatUsage(result.usage);
+    const usageLine = formatUsage(result.usage, { requestedModel: options.model });
     if (usageLine) console.log(`\n---\n${usageLine}`);
   } catch (err) {
     console.error(`Adversarial review failed: ${err.message}`);
@@ -394,7 +394,7 @@ async function handleTask(argv) {
       }, log));
 
     console.log(result.rendered);
-    const usageLine = formatUsage(result.usage);
+    const usageLine = formatUsage(result.usage, { requestedModel: options.model });
     if (usageLine) console.log(`\n---\n${usageLine}`);
     if (result.changedFiles?.length) {
       console.log(`\nChanged files:\n${result.changedFiles.map((f) => `- ${f}`).join("\n")}`);
@@ -483,7 +483,7 @@ async function handleWaitAndResult(argv) {
     if (st.status === "completed") {
       const data = readJson(jobDataPath(workspace, job.id));
       console.log(data?.rendered ?? st.result ?? "(task completed with no output)");
-      const usageLine = formatUsage(data?.usage);
+      const usageLine = formatUsage(data?.usage, { requestedModel: data?.requestedModel });
       if (usageLine) console.log(`\n---\n${usageLine}`);
       return true;
     }
@@ -592,7 +592,7 @@ async function handleTaskWorker(argv) {
         const usage = await client.getSessionUsage(sessionId).catch(() => null);
         report("finalizing", "Done");
 
-        return { rendered: text, usage, summary: text.slice(0, 500) };
+        return { rendered: text, usage, requestedModel: options.model, summary: text.slice(0, 500) };
       }, log));
   } catch (err) {
     // Error is already logged by runTrackedJob
