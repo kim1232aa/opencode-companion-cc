@@ -140,7 +140,14 @@ export async function ensureServer(opts = {}) {
   proc.stdout?.on("data", drain);
   proc.stderr?.on("data", drain);
   let spawnError = null;
+  let earlyExit = null;
   proc.on("error", (err) => { spawnError = err; });
+  // If the server process dies during startup (bad config, port already bound,
+  // auth failure, …) fail fast with its exit code + captured output instead of
+  // burning the full 30s timeout.
+  proc.on("exit", (code, signal) => {
+    if (code !== 0) earlyExit = { code, signal };
+  });
   proc.unref();
 
   // Wait for the server to become ready
@@ -148,6 +155,10 @@ export async function ensureServer(opts = {}) {
   while (Date.now() < deadline) {
     if (spawnError) {
       throw new Error(`Failed to spawn 'opencode serve': ${spawnError.message}`);
+    }
+    if (earlyExit) {
+      const detail = diagTail.trim() ? `\nOutput:\n${diagTail.trim()}` : "";
+      throw new Error(`'opencode serve' exited early (code ${earlyExit.code}${earlyExit.signal ? `, signal ${earlyExit.signal}` : ""}) before becoming ready.${detail}`);
     }
     if (await isServerRunning(host, port)) {
       return { url, pid: proc.pid, alreadyRunning: false };
@@ -278,12 +289,21 @@ export function createClient(baseUrl, opts = {}) {
     // Sessions
     listSessions: () => request("GET", "/session"),
     // On a busy shared daemon (multiple Claude Code windows dispatching
-    // concurrently), session creation itself can queue behind other work
-    // for longer than the generic 5-minute default — well before the
-    // prompt's own 10-minute budget (below) even starts. Give it the same
-    // ceiling so it doesn't fail out from under a request that hasn't
-    // actually begun yet.
-    createSession: (opts = {}) => request("POST", "/session", opts, 600_000),
+    // concurrently), session creation can queue behind other work for minutes.
+    // It MUST go through httpPostJson (node:http) rather than fetch: undici's
+    // hidden 300s bodyTimeout would otherwise kill it at 5m00s regardless of
+    // any AbortSignal we set — the same trap sendPrompt avoids.
+    createSession: async (opts = {}) => {
+      const { status, body } = await httpPostJson(`${baseUrl}/session`, headers, opts);
+      if (status < 200 || status >= 300) {
+        throw new Error(`OpenCode API POST /session returned ${status}: ${body}`);
+      }
+      try {
+        return JSON.parse(body);
+      } catch (err) {
+        throw new Error(`OpenCode createSession returned non-JSON (${status}): ${err.message}`);
+      }
+    },
     getSession: (id) => request("GET", `/session/${id}`),
     deleteSession: (id) => request("DELETE", `/session/${id}`),
     abortSession: (id) => request("POST", `/session/${id}/abort`),

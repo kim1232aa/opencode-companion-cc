@@ -12,16 +12,38 @@ export function parseArgs(argv, schema = {}) {
   const options = {};
   const positional = [];
 
+  let endOfOptions = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (endOfOptions) {
+      positional.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      endOfOptions = true;
+      continue;
+    }
     if (!arg.startsWith("--")) {
       positional.push(arg);
       continue;
     }
-    const key = arg.slice(2);
+    let key = arg.slice(2);
+    let inlineValue;
+    const eqIdx = key.indexOf("=");
+    if (eqIdx !== -1) {
+      inlineValue = key.slice(eqIdx + 1);
+      key = key.slice(0, eqIdx);
+    }
     if (valueSet.has(key)) {
-      options[key] = argv[++i] ?? "";
-    } else if (boolSet.has(key) || !valueSet.has(key)) {
+      if (inlineValue !== undefined) {
+        options[key] = inlineValue;
+      } else {
+        options[key] = argv[++i] ?? "";
+      }
+    } else if (boolSet.has(key)) {
+      options[key] = true;
+    } else {
+      process.stderr.write(`warning: unknown option --${key}\n`);
       options[key] = true;
     }
   }
@@ -41,12 +63,25 @@ export function extractTaskText(argv, flagsWithValue = [], booleanFlags = []) {
   const boolSet = new Set(booleanFlags);
   const parts = [];
 
+  let endOfOptions = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (endOfOptions) {
+      parts.push(arg);
+      continue;
+    }
+    if (arg === "--") {
+      endOfOptions = true;
+      continue;
+    }
     if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      if (valSet.has(key)) {
-        i++; // skip value
+      let key = arg.slice(2);
+      const eqIdx = key.indexOf("=");
+      if (eqIdx !== -1) {
+        key = key.slice(0, eqIdx);
+        // inline value form: no next token to consume
+      } else if (valSet.has(key)) {
+        i++; // skip value token
       }
       // skip boolean flags silently
       continue;

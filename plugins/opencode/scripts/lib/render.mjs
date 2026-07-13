@@ -1,5 +1,4 @@
 // Output rendering for the OpenCode companion.
-
 /**
  * Render a status snapshot as human-readable text.
  * @param {{ running: object[], latestFinished: object|null, recent: object[] }} snapshot
@@ -7,7 +6,6 @@
  */
 export function renderStatus(snapshot) {
   const lines = [];
-
   if (snapshot.running.length > 0) {
     lines.push("## Running Jobs\n");
     for (const job of snapshot.running) {
@@ -18,7 +16,6 @@ export function renderStatus(snapshot) {
     }
     lines.push("");
   }
-
   if (snapshot.latestFinished) {
     lines.push("## Latest Finished\n");
     const j = snapshot.latestFinished;
@@ -28,7 +25,6 @@ export function renderStatus(snapshot) {
     }
     lines.push("");
   }
-
   if (snapshot.recent.length > 1) {
     lines.push("## Recent Jobs\n");
     for (const j of snapshot.recent.slice(1)) {
@@ -36,14 +32,11 @@ export function renderStatus(snapshot) {
     }
     lines.push("");
   }
-
   if (lines.length === 0) {
     lines.push("No OpenCode jobs found for this workspace.");
   }
-
   return lines.join("\n");
 }
-
 /**
  * Render a job result as human-readable text.
  * @param {object} job
@@ -52,20 +45,16 @@ export function renderStatus(snapshot) {
  */
 export function renderResult(job, resultData) {
   const lines = [];
-
   lines.push(`## Job: ${job.id}\n`);
   lines.push(`- **Type**: ${job.type}`);
   lines.push(`- **Status**: ${job.status}`);
   lines.push(`- **Duration**: ${job.elapsed ?? "unknown"}`);
-
   if (job.opencodeSessionId) {
     lines.push(`- **OpenCode Session**: ${job.opencodeSessionId}`);
   }
-
   lines.push("");
-
   if (job.status === "failed") {
-    lines.push(`### Error\n\n${job.errorMessage ?? "Unknown error"}`);
+    lines.push(`### Error\n\n${job.errorMessage || `Unknown error (job ${job.id})`}`);
   } else if (resultData) {
     if (resultData.rendered) {
       lines.push(`### Output\n\n${resultData.rendered}`);
@@ -82,7 +71,6 @@ export function renderResult(job, resultData) {
     } else {
       lines.push("### Output\n\n(No output captured)");
     }
-
     if (resultData.changedFiles?.length > 0) {
       lines.push(`\n### Changed Files\n`);
       for (const f of resultData.changedFiles) {
@@ -92,33 +80,63 @@ export function renderResult(job, resultData) {
   } else if (job.result) {
     lines.push(`### Output\n\n${job.result}`);
   }
-
   return lines.join("\n");
 }
-
 /**
  * Render a review result (structured JSON output).
- * @param {object} review
+ * @param {object|Array} review
  * @returns {string}
  */
 export function renderReview(review) {
   const lines = [];
-
-  if (review.verdict) {
-    const emoji = review.verdict === "approve" ? "PASS" : "NEEDS ATTENTION";
-    lines.push(`## Review Verdict: ${emoji}\n`);
+  
+  // Determine the findings list
+  let findings;
+  if (Array.isArray(review)) {
+    findings = review;
+  } else if (review && Array.isArray(review.findings)) {
+    findings = review.findings;
+    if (review.verdict) {
+      const emoji = review.verdict === "approve" ? "PASS" : "NEEDS ATTENTION";
+      lines.push(`## Review Verdict: ${emoji}\n`);
+    }
+    if (review.summary) {
+      lines.push(`${review.summary}\n`);
+    }
+  } else {
+    lines.push("Could not parse structured review; raw output follows");
+    lines.push("```");
+    lines.push(JSON.stringify(review, null, 2));
+    lines.push("```");
+    return lines.join("\n");
   }
 
-  if (review.summary) {
-    lines.push(`${review.summary}\n`);
-  }
-
-  if (review.findings?.length > 0) {
-    lines.push(`### Findings (${review.findings.length})\n`);
-    for (const f of review.findings) {
-      lines.push(`#### ${f.severity?.toUpperCase()}: ${f.title}`);
-      lines.push(`- **File**: ${f.file}:${f.line_start}-${f.line_end}`);
-      lines.push(`- **Confidence**: ${(f.confidence * 100).toFixed(0)}%`);
+  if (findings.length > 0) {
+    lines.push(`### Findings (${findings.length})\n`);
+    for (const f of findings) {
+      const severity = f.severity ? f.severity.toUpperCase() : "n/a";
+      lines.push(`#### ${severity}: ${f.title}`);
+      
+      // File and line handling
+      const fileParts = [];
+      if (f.file) fileParts.push(f.file);
+      const lineParts = [];
+      if (f.line_start != null) lineParts.push(f.line_start);
+      if (f.line_end != null && f.line_end !== f.line_start) lineParts.push(f.line_end);
+      if (fileParts.length > 0) {
+        const fileLine = lineParts.length > 0 ? `${fileParts[0]}:${lineParts.join("-")}` : fileParts[0];
+        lines.push(`- **File**: ${fileLine}`);
+      } else {
+        lines.push(`- **File**: n/a`);
+      }
+      
+      // Confidence handling
+      if (typeof f.confidence === "number" && Number.isFinite(f.confidence)) {
+        lines.push(`- **Confidence**: ${(f.confidence * 100).toFixed(0)}%`);
+      } else {
+        lines.push(`- **Confidence**: n/a`);
+      }
+      
       lines.push(`- ${f.body}`);
       lines.push(`- **Recommendation**: ${f.recommendation}`);
       lines.push("");
@@ -126,10 +144,8 @@ export function renderReview(review) {
   } else {
     lines.push("No findings.");
   }
-
   return lines.join("\n");
 }
-
 /**
  * Extract text content from a message object.
  * @param {object} msg
@@ -151,7 +167,6 @@ function extractMessageText(msg) {
   }
   return JSON.stringify(msg);
 }
-
 /**
  * Render setup status.
  * @param {object} status
@@ -160,7 +175,6 @@ function extractMessageText(msg) {
 export function renderSetup(status) {
   const lines = [];
   lines.push("## OpenCode Setup Status\n");
-
   lines.push(`- **Installed**: ${status.installed ? "Yes" : "No"}`);
   if (status.version) {
     lines.push(`- **Version**: ${status.version}`);
@@ -176,6 +190,5 @@ export function renderSetup(status) {
   if (status.reviewGate !== undefined) {
     lines.push(`- **Review Gate**: ${status.reviewGate ? "Enabled" : "Disabled"}`);
   }
-
   return lines.join("\n");
 }
