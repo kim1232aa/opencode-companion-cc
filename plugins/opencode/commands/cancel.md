@@ -1,5 +1,5 @@
 ---
-description: Cancel an active background OpenCode job
+description: Cancel an OpenCode job (no id ⇒ all this session's running jobs)
 argument-hint: '[job-id-prefix]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)

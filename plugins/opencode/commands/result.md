@@ -1,5 +1,5 @@
 ---
-description: Show final output for a finished OpenCode job, including session ID for resuming
+description: Show a finished OpenCode job's output and session ID
 argument-hint: '[job-id-prefix]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)

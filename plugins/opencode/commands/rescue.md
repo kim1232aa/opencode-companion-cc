@@ -1,5 +1,5 @@
 ---
-description: Delegate investigation, an explicit fix request, or follow-up rescue work to the OpenCode rescue subagent
+description: Delegate a task, investigation, or fix to OpenCode
 argument-hint: "[--background|--wait] [--resume|--fresh] [--worktree] [--model <provider/model>] [--agent <build|plan>] [what OpenCode should investigate, solve, or continue]"
 context: fork
 allowed-tools: Bash(node:*)

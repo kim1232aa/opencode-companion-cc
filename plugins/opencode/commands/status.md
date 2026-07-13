@@ -1,5 +1,5 @@
 ---
-description: Show running and recent OpenCode jobs for the current repository
+description: Show this repo's running and recent OpenCode jobs
 argument-hint: ''
 disable-model-invocation: true
 allowed-tools: Bash(node:*)

@@ -13,9 +13,9 @@ import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/pr
 import { isServerRunning, createClient, connect, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs";
-import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
+import { buildStatusSnapshot, resolveResultJob, resolveCancelableJobs, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
-import { renderStatus, renderResult, renderReview, renderSetup, formatUsage } from "./lib/render.mjs";
+import { renderStatus, renderResult, renderReview, renderSetup, formatUsage, formatTrailer } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson } from "./lib/fs.mjs";
@@ -26,6 +26,21 @@ const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.d
 function defaultServerUrl() {
   const port = Number(process.env.OPENCODE_SERVER_PORT) || 4096;
   return `http://127.0.0.1:${port}`;
+}
+
+// Print the delegate/result stdout tail. Default: a single concise trailer line
+// (✓ out tokens · model · session). The full multi-line breakdown still lives in
+// `/opencode:result`; set OPENCODE_COMPANION_VERBOSE_TRAILER=1 to get it inline
+// here too. A model mismatch / empty usage still surfaces via the trailer's own
+// ⚠️ handling, so no correctness signal is lost by the concise default.
+function printTrailer(usage, { requestedModel, sessionId } = {}) {
+  if (/^(1|true|yes|on)$/i.test(process.env.OPENCODE_COMPANION_VERBOSE_TRAILER || "")) {
+    const full = formatUsage(usage, { requestedModel });
+    if (full) console.log(`\n---\n${full}`);
+    return;
+  }
+  const line = formatTrailer(usage, { requestedModel, sessionId });
+  if (line) console.log(`\n${line}`);
 }
 
 // Validate a --model ref against the server's real model list; throw a helpful
@@ -195,12 +210,12 @@ async function handleReview(argv) {
         raw: response,
         structured,
         usage,
+        opencodeSessionId: sessionId,
       };
     });
 
     console.log(result.rendered);
-    const usageLine = formatUsage(result.usage, { requestedModel: options.model });
-    if (usageLine) console.log(`\n---\n${usageLine}`);
+    printTrailer(result.usage, { requestedModel: options.model, sessionId: result.opencodeSessionId });
   } catch (err) {
     console.error(`Review failed: ${err.message}`);
     process.exit(1);
@@ -256,12 +271,12 @@ async function handleAdversarialReview(argv) {
         raw: response,
         structured,
         usage,
+        opencodeSessionId: sessionId,
       };
     });
 
     console.log(result.rendered);
-    const usageLine = formatUsage(result.usage, { requestedModel: options.model });
-    if (usageLine) console.log(`\n---\n${usageLine}`);
+    printTrailer(result.usage, { requestedModel: options.model, sessionId: result.opencodeSessionId });
   } catch (err) {
     console.error(`Adversarial review failed: ${err.message}`);
     process.exit(1);
@@ -391,12 +406,12 @@ async function handleTask(argv) {
           changedFiles,
           usage,
           summary: text.slice(0, 500),
+          opencodeSessionId: sessionId,
         };
       }, log));
 
     console.log(result.rendered);
-    const usageLine = formatUsage(result.usage, { requestedModel: options.model });
-    if (usageLine) console.log(`\n---\n${usageLine}`);
+    printTrailer(result.usage, { requestedModel: options.model, sessionId: result.opencodeSessionId });
     if (result.changedFiles?.length) {
       console.log(`\nChanged files:\n${result.changedFiles.map((f) => `- ${f}`).join("\n")}`);
     }
@@ -484,8 +499,10 @@ async function handleWaitAndResult(argv) {
     if (st.status === "completed") {
       const data = readJson(jobDataPath(workspace, job.id));
       console.log(data?.rendered ?? st.result ?? "(task completed with no output)");
-      const usageLine = formatUsage(data?.usage, { requestedModel: data?.requestedModel });
-      if (usageLine) console.log(`\n---\n${usageLine}`);
+      printTrailer(data?.usage, {
+        requestedModel: data?.requestedModel,
+        sessionId: data?.opencodeSessionId ?? st.opencodeSessionId,
+      });
       return true;
     }
     if (st.status === "failed") {
@@ -573,7 +590,7 @@ async function handleTaskWorker(argv) {
         const usage = await client.getSessionUsage(sessionId).catch(() => null);
         report("finalizing", "Done");
 
-        return { rendered: text, usage, requestedModel: options.model, summary: text.slice(0, 500) };
+        return { rendered: text, usage, requestedModel: options.model, summary: text.slice(0, 500), opencodeSessionId: sessionId };
       }, log));
   } catch (err) {
     // Error is already logged by runTrackedJob
@@ -684,64 +701,79 @@ async function handleCancel(argv) {
   const sessionId = getClaudeSessionId();
   const jobs = reconcileStrandedJobs(workspace, loadState(workspace).jobs ?? []);
 
-  const { job, ambiguous } = resolveCancelableJob(jobs, ref, { sessionId });
+  // No ref ⇒ cancel EVERY running job for this Claude session (cancel-all),
+  // strictly session-scoped so another session's jobs are never touched. A ref
+  // still targets exactly that one job.
+  const { jobs: targets, ambiguous } = resolveCancelableJobs(jobs, ref, { sessionId });
 
   if (ambiguous) {
-    console.error("Multiple running jobs. Please specify a job ID prefix.");
+    console.error("Ambiguous job reference — multiple running jobs match that prefix. Specify a full job ID.");
     process.exit(1);
   }
 
-  if (!job) {
+  if (!targets.length) {
     console.log("No active job to cancel.");
     return;
   }
 
-  // Abort the OpenCode session if we have one
-  if (job.opencodeSessionId) {
-    try {
-      const client = createClient(defaultServerUrl());
-      await client.abortSession(job.opencodeSessionId);
-    } catch {
-      // Server may not be running
+  const client = createClient(defaultServerUrl());
+  const canceled = [];
+  const alreadyDone = [];
+
+  for (const job of targets) {
+    // Abort the OpenCode session if we have one.
+    if (job.opencodeSessionId) {
+      try {
+        await client.abortSession(job.opencodeSessionId);
+      } catch {
+        // Server may not be running.
+      }
     }
+
+    // Signal ONLY a detached background worker. A foreground job's recorded pid
+    // is the dispatcher process itself (the user's live Bash call) — SIGTERMing
+    // it from another session would kill that call mid-output; abortSession above
+    // already makes its sendPrompt return. Ownership is verified via the kernel
+    // start-time fingerprint so a recycled pid is never signalled.
+    if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
+      try {
+        process.kill(job.pid, "SIGTERM");
+      } catch {
+        // race: gone between the liveness check and the signal
+      }
+    }
+
+    // Compare-and-set INSIDE the state lock: the worker may finish (completed/
+    // failed) during the abortSession round-trip, and a check-then-write outside
+    // the lock could still clobber that terminal result with "canceled".
+    let finalStatus = null;
+    updateState(workspace, (state) => {
+      const j = state.jobs?.find((x) => x.id === job.id);
+      if (!j) return;
+      if (j.status !== "running" && j.status !== "pending") {
+        finalStatus = j.status; // already terminal — leave it
+        return;
+      }
+      j.status = "canceled";
+      j.completedAt = new Date().toISOString();
+      j.errorMessage = "Canceled by user";
+      j.updatedAt = new Date().toISOString();
+      finalStatus = "canceled";
+    });
+
+    if (finalStatus === "canceled") canceled.push(job.id);
+    else if (finalStatus) alreadyDone.push(`${job.id} (${finalStatus})`);
   }
 
-  // Signal ONLY a detached background worker. A foreground job's recorded pid
-  // is the dispatcher process itself (the user's live Bash call) — SIGTERMing
-  // it from another session would kill that call mid-output; abortSession above
-  // already makes its sendPrompt return. Ownership is verified via the kernel
-  // start-time fingerprint so a recycled pid is never signalled.
-  if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
-    try {
-      process.kill(job.pid, "SIGTERM");
-    } catch {
-      // race: gone between the liveness check and the signal
-    }
+  if (canceled.length) {
+    console.log(`Canceled ${canceled.length} job${canceled.length === 1 ? "" : "s"}: ${canceled.join(", ")}`);
   }
-
-  // Compare-and-set INSIDE the state lock: the worker may finish (completed/
-  // failed) during the abortSession round-trip, and a check-then-write outside
-  // the lock could still clobber that terminal result with "canceled".
-  let finalStatus = null;
-  updateState(workspace, (state) => {
-    const j = state.jobs?.find((x) => x.id === job.id);
-    if (!j) return;
-    if (j.status !== "running" && j.status !== "pending") {
-      finalStatus = j.status; // already terminal — leave it
-      return;
-    }
-    j.status = "canceled";
-    j.completedAt = new Date().toISOString();
-    j.errorMessage = "Canceled by user";
-    j.updatedAt = new Date().toISOString();
-    finalStatus = "canceled";
-  });
-
-  if (finalStatus && finalStatus !== "canceled") {
-    console.log(`Job ${job.id} already ${finalStatus}; nothing to cancel.`);
-    return;
+  if (alreadyDone.length) {
+    console.log(`Already finished (not canceled): ${alreadyDone.join(", ")}`);
   }
-  console.log(`Canceled job: ${job.id}`);
+  if (!canceled.length && !alreadyDone.length) {
+    console.log("No active job to cancel.");
+  }
 }
 
 // ------------------------------------------------------------------
