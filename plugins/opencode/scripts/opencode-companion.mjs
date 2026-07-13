@@ -33,6 +33,7 @@ const handlers = {
   review: handleReview,
   "adversarial-review": handleAdversarialReview,
   task: handleTask,
+  "wait-and-result": handleWaitAndResult,
   "task-worker": handleTaskWorker,
   "task-resume-candidate": handleTaskResumeCandidate,
   status: handleStatus,
@@ -348,6 +349,106 @@ async function handleTask(argv) {
     console.error(`Task failed: ${err.message}`);
     process.exit(1);
   }
+}
+
+// Dispatch a task on a detached worker (so it is tracked, survivable, and
+// visible to status/result/cancel) but BLOCK until it reaches a terminal
+// state and then print the full result. This is the reliable "delegate AND
+// get the result back in one call" path — the caller never has to poll a
+// job-id or guess which session/cwd the result landed under (the exact pain
+// that made background review results so hard to collect).
+async function handleWaitAndResult(argv) {
+  const { options } = parseArgs(argv, {
+    valueOptions: ["model", "agent", "timeout-ms"],
+    booleanOptions: ["write", "resume-last", "fresh"],
+  });
+  const taskText = extractTaskText(argv, ["model", "agent", "timeout-ms"], [
+    "write", "resume-last", "fresh",
+  ]);
+  if (!taskText) {
+    console.error("No task text provided.");
+    process.exit(1);
+  }
+
+  const workspace = await resolveWorkspace();
+  const agentName = options.agent ?? "build";
+  const isWrite = agentName !== "plan";
+
+  let resumeSessionId = null;
+  if (options["resume-last"]) {
+    const state = loadState(workspace);
+    const sid = getClaudeSessionId();
+    const lastTask = state.jobs
+      ?.filter((j) => j.type === "task" && j.opencodeSessionId)
+      ?.filter((j) => !sid || j.sessionId === sid)
+      ?.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))?.[0];
+    if (lastTask?.opencodeSessionId) resumeSessionId = lastTask.opencodeSessionId;
+  }
+
+  const job = createJobRecord(workspace, "task", { agent: agentName, resumeSessionId });
+
+  const workerArgs = [
+    path.join(PLUGIN_ROOT, "scripts", "opencode-companion.mjs"),
+    "task-worker",
+    "--job-id", job.id,
+    "--workspace", workspace,
+    "--task-text", taskText,
+    "--agent", agentName,
+  ];
+  if (isWrite) workerArgs.push("--write");
+  if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
+  if (options.model) workerArgs.push("--model", options.model);
+
+  const child = spawnDetached("node", workerArgs, { cwd: workspace });
+  if (child?.pid) upsertJob(workspace, { id: job.id, pid: child.pid });
+
+  const timeoutMs = Number(options["timeout-ms"]) > 0
+    ? Number(options["timeout-ms"])
+    : Number(process.env.OPENCODE_COMPANION_WAIT_TIMEOUT_MS) || 35 * 60 * 1000;
+  const deadline = Date.now() + timeoutMs;
+  const POLL_MS = 1500;
+
+  const printTerminal = (st) => {
+    if (st.status === "completed") {
+      const data = readJson(jobDataPath(workspace, job.id));
+      console.log(data?.rendered ?? st.result ?? "(task completed with no output)");
+      return true;
+    }
+    if (st.status === "failed") {
+      console.error(`Task ${job.id} failed: ${st.errorMessage ?? "unknown error"}`);
+      process.exit(1);
+    }
+    return false;
+  };
+
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, POLL_MS));
+    const st = loadState(workspace).jobs?.find((j) => j.id === job.id);
+    if (!st) continue;
+    if (printTerminal(st)) return;
+
+    // Fail fast if the detached worker died without writing a terminal status.
+    if (st.pid) {
+      let workerGone = false;
+      try {
+        process.kill(st.pid, 0);
+      } catch (e) {
+        workerGone = e.code === "ESRCH";
+      }
+      if (workerGone) {
+        const again = loadState(workspace).jobs?.find((j) => j.id === job.id);
+        if (again && printTerminal(again)) return;
+        console.error(`Task ${job.id} worker (pid ${st.pid}) exited without completing.`);
+        process.exit(1);
+      }
+    }
+  }
+
+  console.error(
+    `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${job.id}. ` +
+    `It may still finish — check \`/opencode:status\` and \`/opencode:result ${job.id}\`.`
+  );
+  process.exit(1);
 }
 
 async function handleTaskWorker(argv) {
