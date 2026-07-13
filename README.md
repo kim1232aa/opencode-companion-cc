@@ -19,10 +19,12 @@ Delegate coding tasks — or run code reviews — from inside Claude Code to [Op
 
 ## What You Get
 
-- `/opencode:rescue` — delegate a task to OpenCode (`--model`, `--agent`, `--resume`, `--fresh`, `--background`)
+- `/opencode:rescue` — delegate a task to OpenCode (`--model`, `--agent`, `--resume`, `--fresh`, `--background`, `--worktree`). Blocks and returns the actual result by default (via `wait-and-result`); `--background` is fire-and-forget.
 - `/opencode:review` / `/opencode:adversarial-review` — read-only or steerable challenge reviews (both now honor `--model`)
 - `/opencode:status`, `/opencode:result`, `/opencode:cancel` — manage background jobs
 - `/opencode:setup` — check install/auth, toggle the review gate
+
+Every delegated run also reports OpenCode-side **token usage and cost** (input / output / reasoning / cache, plus turn count and `$` when the backend prices it). Write-capable runs can opt into `--worktree` for **git-worktree isolation** so a concurrent editing session can't be clobbered by OpenCode's snapshot/undo.
 
 ## Requirements
 
@@ -91,11 +93,16 @@ Then delegate with `/opencode:rescue --model my-endpoint/some-model "…"`.
 | Model routing | Current OpenCode REST requires `model` as a `{providerID, modelID}` object; the plugin sent a raw string → every `--model` call 400'd | `parseModelRef()` splits on the first `/` and sends the object form |
 | Read-only | `--write` was a dead flag that always evaluated true; even `--agent plan` left the runtime believing it had write access | `isWrite` derived from the resolved agent (`plan` ⇒ read-only) |
 | Prompt fidelity | The rescue subagent was permitted to "tighten" the prompt, silently compressing long task text before forwarding | Byte-for-byte forwarding mandated in both the agent def and its runtime skill |
-| `--model` in reviews | `/opencode:review` / `--adversarial-review` parsed only `--base`/`--scope`; `--model` was swallowed | `--model` threaded through both review handlers |
+| `--model` in reviews | `/opencode:review` / `--adversarial-review` parsed only `--base`; `--model` was swallowed | `--model` threaded through both review handlers |
 | Provider list | `/opencode:setup` assumed `/provider` returned an array; new OpenCode returns `{all, default, connected}` → always empty | Handles both shapes |
 | Headless permission hang | An `external_directory` (or other) permission prompt in a headless dispatch is never answerable → 5–10 min hang | A watcher polls `/permission` and auto-rejects un-answerable prompts, so the agent gets a normal tool-error it can react to |
 | Concurrent job state | Unlocked read-modify-write of `state.json` lost job updates under parallel background jobs (~1/3 of the time at 5–8 concurrent) | A filesystem lock (`withFileLock`) serializes state writes |
 | websearch | The `websearch` tool is a no-op on custom providers unless `OPENCODE_ENABLE_EXA=1` | Set on the managed `opencode serve` process |
+| No token visibility (2.0.1) | `extractResponseText` discarded `response.info`, so the OpenCode-side token/cost of a delegated run was never surfaced | `getSessionUsage()` sums assistant-message `tokens`/`cost` across the session; every dispatch path renders a token-usage line (derives `total` when a build omits it) |
+| Recycled-PID kill (2.0.1) | `cancel` and the stranded-job reaper checked only pid *liveness*; a reused pid could be signalled/mis-reconciled — and the comment falsely claimed an ownership check | `pidStartTime()` fingerprints the worker via `/proc/<pid>/stat` field 22; `isOwnedProcessAlive()` only treats a pid as ours when the start-time matches (bare-liveness fallback off-Linux) |
+| Untracked background pid (2.0.1) | `rescue --background` never recorded its detached worker's pid, so `cancel` couldn't stop it and death-detection couldn't fire | The pid + start-time are persisted for background jobs too |
+| Worktree isolation (2.0.1) | Running `build` in a live repo let OpenCode's git snapshot/undo revert unrelated concurrent edits; a first cut piped the patch via a stdin that `runCommand` ignores → nothing applied back | Opt-in `--worktree` runs in a throwaway detached worktree, then applies the captured patch back through a temp file (refusing a truncated/oversized diff), surfacing conflicts instead of clobbering |
+| Dead `--scope` flag (2.0.1) | `/opencode:review` advertised `--scope auto\|working-tree\|branch` but the value was parsed and never used | Removed from parsing and docs; `--base` is the real control |
 
 Additional hardening (background-job self-heal, recursive-delegation guard,
 error classification, and expanded test coverage) is consolidated from the
@@ -103,7 +110,7 @@ suharvest and JohnnyVicious forks — see the [NOTICE](NOTICE) file for attribut
 
 ## Slash Commands
 
-- `/opencode:rescue` — delegate a task via the `opencode:opencode-rescue` subagent. `--model <provider/model>`, `--agent <build|plan>`, `--resume`, `--fresh`, `--background`.
+- `/opencode:rescue` — delegate a task via the `opencode:opencode-rescue` subagent. Blocks and returns the real result by default; `--background` is fire-and-forget. `--model <provider/model>`, `--agent <build|plan>`, `--resume`, `--fresh`, `--background`, `--worktree`.
 - `/opencode:review` — read-only OpenCode review. `--base <ref>`, `--model <id>`, `--wait`, `--background`.
 - `/opencode:adversarial-review` — steerable challenge review; accepts custom focus text. `--model <id>`.
 - `/opencode:status` / `/opencode:result` / `/opencode:cancel` — manage background jobs.

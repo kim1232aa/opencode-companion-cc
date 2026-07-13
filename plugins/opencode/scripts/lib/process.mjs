@@ -84,6 +84,7 @@ export function runCommand(cmd, args, opts = {}) {
     let settled = false;
     let overflowed = false;
     let stdoutBytes = 0;
+    let stderrBytes = 0;
     const maxOutputBytes =
       typeof opts.maxOutputBytes === "number" && opts.maxOutputBytes >= 0
         ? opts.maxOutputBytes
@@ -109,7 +110,23 @@ export function runCommand(cmd, args, opts = {}) {
       stdout += d;
     });
     proc.stderr.on("data", (d) => {
-      if (!settled) stderr += d;
+      if (settled || overflowed) return;
+      if (maxOutputBytes !== undefined) {
+        if (stderrBytes + d.length > maxOutputBytes) {
+          overflowed = true;
+          const remaining = Math.max(0, maxOutputBytes - stderrBytes);
+          if (remaining > 0) {
+            stderr += d.subarray(0, remaining).toString();
+            stderrBytes += remaining;
+          }
+          proc.kill();
+          return;
+        }
+        stderr += d;
+        stderrBytes += d.length;
+        return;
+      }
+      stderr += d;
     });
     proc.on("error", (err) => {
       if (settled) return;

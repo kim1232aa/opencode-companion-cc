@@ -6,9 +6,11 @@
  */
 export function renderStatus(snapshot) {
   const lines = [];
-  if (snapshot.running.length > 0) {
+  const running = Array.isArray(snapshot.running) ? snapshot.running : [];
+  const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
+  if (running.length > 0) {
     lines.push("## Running Jobs\n");
-    for (const job of snapshot.running) {
+    for (const job of running) {
       lines.push(`- **${job.id}** (${job.type}) — ${job.phase ?? "running"} — ${job.elapsed ?? "just started"}`);
       if (job.progressPreview) {
         lines.push(`  > ${job.progressPreview.split("\n").join("\n  > ")}`);
@@ -25,9 +27,9 @@ export function renderStatus(snapshot) {
     }
     lines.push("");
   }
-  if (snapshot.recent.length > 1) {
+  if (recent.length > 1) {
     lines.push("## Recent Jobs\n");
-    for (const j of snapshot.recent.slice(1)) {
+    for (const j of recent.slice(1)) {
       lines.push(`- **${j.id}** (${j.type}) — ${j.status} — ${j.elapsed}`);
     }
     lines.push("");
@@ -58,7 +60,7 @@ export function renderResult(job, resultData) {
   } else if (resultData) {
     if (resultData.rendered) {
       lines.push(`### Output\n\n${resultData.rendered}`);
-    } else if (resultData.messages) {
+    } else if (Array.isArray(resultData.messages)) {
       // Extract the last assistant message
       const assistantMsgs = resultData.messages.filter((m) => m.role === "assistant");
       const last = assistantMsgs[assistantMsgs.length - 1];
@@ -77,10 +79,45 @@ export function renderResult(job, resultData) {
         lines.push(`- ${f}`);
       }
     }
+    const usageLine = formatUsage(resultData.usage);
+    if (usageLine) {
+      lines.push(`\n### Token Usage\n`);
+      lines.push(usageLine);
+    }
   } else if (job.result) {
     lines.push(`### Output\n\n${job.result}`);
   }
   return lines.join("\n");
+}
+/**
+ * Format a session usage accumulator into a one-line token/cost summary.
+ * Returns "" when there is nothing meaningful to show.
+ * @param {object} [usage]
+ * @returns {string}
+ */
+export function formatUsage(usage) {
+  if (!usage || typeof usage !== "object") return "";
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const total = num(usage.total);
+  const input = num(usage.input);
+  const output = num(usage.output);
+  const reasoning = num(usage.reasoning);
+  const cacheRead = num(usage.cacheRead);
+  const cacheWrite = num(usage.cacheWrite);
+  const cost = num(usage.cost);
+  const turns = num(usage.turns);
+  if (total === 0 && input === 0 && output === 0 && cost === 0) return "";
+  const parts = [`**Tokens**: ${total.toLocaleString()} total`];
+  const breakdown = [];
+  if (input) breakdown.push(`in ${input.toLocaleString()}`);
+  if (output) breakdown.push(`out ${output.toLocaleString()}`);
+  if (reasoning) breakdown.push(`reasoning ${reasoning.toLocaleString()}`);
+  if (cacheRead) breakdown.push(`cache-read ${cacheRead.toLocaleString()}`);
+  if (cacheWrite) breakdown.push(`cache-write ${cacheWrite.toLocaleString()}`);
+  if (breakdown.length) parts[0] += ` (${breakdown.join(", ")})`;
+  if (turns) parts.push(`${turns} turn${turns === 1 ? "" : "s"}`);
+  if (cost > 0) parts.push(`~$${cost.toFixed(4)}`);
+  return `- ${parts.join(" · ")}`;
 }
 /**
  * Render a review result (structured JSON output).
@@ -114,15 +151,22 @@ export function renderReview(review) {
   if (findings.length > 0) {
     lines.push(`### Findings (${findings.length})\n`);
     for (const f of findings) {
+      if (!f || typeof f !== "object") continue;
       const severity = f.severity ? f.severity.toUpperCase() : "n/a";
       lines.push(`#### ${severity}: ${f.title}`);
-      
+
       // File and line handling
       const fileParts = [];
       if (f.file) fileParts.push(f.file);
       const lineParts = [];
-      if (f.line_start != null) lineParts.push(f.line_start);
-      if (f.line_end != null && f.line_end !== f.line_start) lineParts.push(f.line_end);
+      if (typeof f.line_start === "number" && Number.isFinite(f.line_start)) lineParts.push(f.line_start);
+      if (
+        typeof f.line_end === "number" &&
+        Number.isFinite(f.line_end) &&
+        f.line_end !== f.line_start
+      ) {
+        lineParts.push(f.line_end);
+      }
       if (fileParts.length > 0) {
         const fileLine = lineParts.length > 0 ? `${fileParts[0]}:${lineParts.join("-")}` : fileParts[0];
         lines.push(`- **File**: ${fileLine}`);

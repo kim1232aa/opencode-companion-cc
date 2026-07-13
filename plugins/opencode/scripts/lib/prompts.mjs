@@ -23,9 +23,9 @@ export async function buildReviewPrompt(cwd, opts, pluginRoot) {
   if (opts.adversarial) {
     const templatePath = path.join(pluginRoot, "prompts", "adversarial-review.md");
     systemPrompt = fs.readFileSync(templatePath, "utf8")
-      .replace("{{TARGET_LABEL}}", opts.base ? `Branch diff against ${opts.base}` : "Working tree changes")
-      .replace("{{USER_FOCUS}}", opts.focus || "General review")
-      .replace("{{REVIEW_INPUT}}", buildReviewContext(diff, status, changedFiles));
+      .replace("{{TARGET_LABEL}}", () => (opts.base ? `Branch diff against ${opts.base}` : "Working tree changes"))
+      .replace("{{USER_FOCUS}}", () => opts.focus || "General review")
+      .replace("{{REVIEW_INPUT}}", () => buildReviewContext(diff, status, changedFiles));
   } else {
     systemPrompt = buildStandardReviewPrompt(diff, status, changedFiles, opts);
   }

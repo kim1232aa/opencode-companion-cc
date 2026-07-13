@@ -80,8 +80,14 @@ function httpPostJson(urlString, headers, bodyObj, opts = {}) {
       req.destroy();
     }, timeoutMs);
 
-    req.write(payload);
-    req.end();
+    // req.write/req.end can throw synchronously (e.g. socket already destroyed);
+    // route that into the promise instead of leaking it and hanging until timeout.
+    try {
+      req.write(payload);
+      req.end();
+    } catch (err) {
+      finish(reject, err);
+    }
   });
 }
 
@@ -337,6 +343,42 @@ export function createClient(baseUrl, opts = {}) {
       if (opts.before) params.set("before", opts.before);
       const qs = params.toString();
       return request("GET", `/session/${sessionId}/message${qs ? "?" + qs : ""}`);
+    },
+
+    /**
+     * Sum token usage + cost across all assistant messages in a session.
+     * Each message's info.tokens is per-turn, so a multi-step agent loop needs
+     * them summed for the true session total. Returns null on failure.
+     */
+    getSessionUsage: async (sessionId) => {
+      try {
+        const msgs = await request("GET", `/session/${sessionId}/message`);
+        const list = Array.isArray(msgs) ? msgs : [];
+        const acc = { total: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+        for (const m of list) {
+          const info = m?.info;
+          if (!info || info.role !== "assistant") continue;
+          const t = info.tokens || {};
+          const input = t.input || 0;
+          const output = t.output || 0;
+          const reasoning = t.reasoning || 0;
+          const cacheRead = t.cache?.read || 0;
+          const cacheWrite = t.cache?.write || 0;
+          // Some opencode builds omit tokens.total; derive it when missing.
+          const total = t.total || input + output + reasoning + cacheRead + cacheWrite;
+          acc.total += total;
+          acc.input += input;
+          acc.output += output;
+          acc.reasoning += reasoning;
+          acc.cacheRead += cacheRead;
+          acc.cacheWrite += cacheWrite;
+          if (typeof info.cost === "number") acc.cost += info.cost;
+          acc.turns += 1;
+        }
+        return acc;
+      } catch {
+        return null;
+      }
     },
 
     /**

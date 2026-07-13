@@ -37,9 +37,14 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
 
 - **Windows is not actively supported.** `resolveOpencodeBinary` uses `which`
   (not `where`) and does not thread `$SHELL`. Linux/macOS are the tested targets.
+- **PID-ownership fingerprint is Linux-only.** `pidStartTime()` reads
+  `/proc/<pid>/stat`; off Linux there is no fingerprint, so `cancel` and the
+  stranded-job reaper fall back to a bare liveness check (the pre-2.0.1
+  behavior). The `--worktree` patch round-trip itself is plain `git` and is
+  cross-platform.
 - **Not ported from upstream forks (out of scope for local-endpoint delegation):**
-  GitHub PR review (`--pr` / `--post`), `--path` targeted reviews, `--free`
-  random free-model selection, and `--worktree` isolation.
+  GitHub PR review (`--pr` / `--post`), `--path` targeted reviews, and `--free`
+  random free-model selection.
 
 ## Cosmetic / minor
 

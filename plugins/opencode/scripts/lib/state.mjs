@@ -144,13 +144,18 @@ export function upsertJob(workspacePath, job) {
     // would otherwise be dropped mid-flight, losing its status/pid/metadata
     // and becoming invisible to status/result/cancel.
     if (state.jobs.length > MAX_JOBS) {
-      const terminal = (j) => j.status === "completed" || j.status === "failed";
+      const terminal = (j) =>
+        j.status === "completed" || j.status === "failed" || j.status === "canceled";
       const active = state.jobs.filter((j) => !terminal(j));
       const done = state.jobs
         .filter(terminal)
-        .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+        .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
       const keepDone = Math.max(0, MAX_JOBS - active.length);
-      state.jobs = [...active, ...done.slice(0, keepDone)];
+      // Keep active jobs + the newest terminal ones, then re-sort the whole
+      // set newest-first so array order stays a valid recency proxy.
+      state.jobs = [...active, ...done.slice(0, keepDone)].sort(
+        (a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0)
+      );
     }
   });
 }

@@ -28,4 +28,11 @@ correct read-only derivation from --agent plan; provider-list parsing for the
 {all, default, connected} response shape; verbatim prompt forwarding; and an
 expanded test suite covering the previously-untested modules.
 
+Additional modifications in v2.0.1: OpenCode-side token/cost reporting on every
+dispatch path (getSessionUsage); a PID start-time ownership fingerprint so
+cancel/reconcile never signal a recycled pid; pid tracking for detached
+background workers; opt-in git-worktree isolation (--worktree) with a
+temp-file patch round-trip; a wait-and-result blocking dispatch made the
+default rescue path; and removal of the dead --scope review flag.
+
 Licensed under the Apache License, Version 2.0. See the LICENSE file.

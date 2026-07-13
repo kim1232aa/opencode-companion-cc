@@ -13,10 +13,11 @@ import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/pr
 import { isServerRunning, ensureServer, createClient, connect } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, generateJobId, jobDataPath } from "./lib/state.mjs";
-import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs } from "./lib/job-control.mjs";
+import { buildStatusSnapshot, resolveResultJob, resolveCancelableJob, enrichJob, reconcileStrandedJobs, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
 import { createJobRecord, runTrackedJob, getClaudeSessionId } from "./lib/tracked-jobs.mjs";
-import { renderStatus, renderResult, renderReview, renderSetup } from "./lib/render.mjs";
+import { renderStatus, renderResult, renderReview, renderSetup, formatUsage } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
+import { withWorktree } from "./lib/worktree.mjs";
 import { getDiff, getStatus as getGitStatus } from "./lib/git.mjs";
 import { readJson } from "./lib/fs.mjs";
 
@@ -131,7 +132,7 @@ async function handleSetup(argv) {
 
 async function handleReview(argv) {
   const { options } = parseArgs(argv, {
-    valueOptions: ["base", "scope", "model"],
+    valueOptions: ["base", "model"],
     booleanOptions: ["wait", "background"],
   });
 
@@ -165,15 +166,19 @@ async function handleReview(argv) {
       // Try to parse structured output
       const text = extractResponseText(response);
       let structured = tryParseJson(text);
+      const usage = await client.getSessionUsage(session.id).catch(() => null);
 
       return {
         rendered: structured ? renderReview(structured) : text,
         raw: response,
         structured,
+        usage,
       };
     });
 
     console.log(result.rendered);
+    const usageLine = formatUsage(result.usage);
+    if (usageLine) console.log(`\n---\n${usageLine}`);
   } catch (err) {
     console.error(`Review failed: ${err.message}`);
     process.exit(1);
@@ -182,7 +187,7 @@ async function handleReview(argv) {
 
 async function handleAdversarialReview(argv) {
   const { options, positional } = parseArgs(argv, {
-    valueOptions: ["base", "scope", "model"],
+    valueOptions: ["base", "model"],
     booleanOptions: ["wait", "background"],
   });
 
@@ -221,15 +226,19 @@ async function handleAdversarialReview(argv) {
 
       const text = extractResponseText(response);
       let structured = tryParseJson(text);
+      const usage = await client.getSessionUsage(session.id).catch(() => null);
 
       return {
         rendered: structured ? renderReview(structured) : text,
         raw: response,
         structured,
+        usage,
       };
     });
 
     console.log(result.rendered);
+    const usageLine = formatUsage(result.usage);
+    if (usageLine) console.log(`\n---\n${usageLine}`);
   } catch (err) {
     console.error(`Adversarial review failed: ${err.message}`);
     process.exit(1);
@@ -243,11 +252,11 @@ async function handleAdversarialReview(argv) {
 async function handleTask(argv) {
   const { options, positional } = parseArgs(argv, {
     valueOptions: ["model", "agent"],
-    booleanOptions: ["write", "background", "wait", "resume-last", "fresh"],
+    booleanOptions: ["write", "background", "wait", "resume-last", "fresh", "worktree"],
   });
 
   const taskText = extractTaskText(argv, ["model", "agent"], [
-    "write", "background", "wait", "resume-last", "fresh",
+    "write", "background", "wait", "resume-last", "fresh", "worktree",
   ]);
 
   if (!taskText) {
@@ -262,6 +271,7 @@ async function handleTask(argv) {
   // --agent plan is the only mechanism that actually toggles read-only.
   const agentName = options.agent ?? "build";
   const isWrite = agentName !== "plan";
+  const useWorktree = !!options.worktree;
 
   // Check for resume
   let resumeSessionId = null;
@@ -294,10 +304,14 @@ async function handleTask(argv) {
       "--agent", agentName,
     ];
     if (isWrite) workerArgs.push("--write");
+    if (useWorktree) workerArgs.push("--worktree");
     if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
     if (options.model) workerArgs.push("--model", options.model);
 
-    spawnDetached("node", workerArgs, { cwd: workspace });
+    const bgChild = spawnDetached("node", workerArgs, { cwd: workspace });
+    if (bgChild?.pid) {
+      upsertJob(workspace, { id: job.id, pid: bgChild.pid, pidStart: pidStartTime(bgChild.pid) });
+    }
     console.log(`OpenCode task started in background: ${job.id}`);
     console.log("Check `/opencode:status` for progress.");
     return;
@@ -305,57 +319,65 @@ async function handleTask(argv) {
 
   // Foreground mode
   try {
-    const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
-      report("starting", "Connecting to OpenCode server...");
-      const client = await connect({ cwd: workspace });
+    const result = await runTrackedJob(workspace, job, async ({ report, log }) =>
+      withWorktree({ dir: workspace, jobId: job.id, useWorktree, isWrite }, async (effectiveCwd) => {
+        report("starting", "Connecting to OpenCode server...");
+        const client = await connect({ cwd: effectiveCwd });
 
-      let sessionId;
-      if (resumeSessionId) {
-        report("starting", `Resuming OpenCode session ${resumeSessionId}...`);
-        sessionId = resumeSessionId;
-      } else {
-        report("starting", "Creating new OpenCode session...");
-        const session = await client.createSession({ title: `Task ${job.id}` });
-        sessionId = session.id;
-      }
-      upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId });
-
-      const prompt = buildTaskPrompt(taskText, { write: isWrite });
-
-      report("investigating", "Sending task to OpenCode...");
-      log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${options.model ?? "(provider default)"}`);
-
-      const response = await client.sendPrompt(sessionId, prompt, {
-        agent: agentName,
-        model: options.model,
-      });
-
-      report("finalizing", "Processing task output...");
-
-      const text = extractResponseText(response);
-
-      // Get changed files if write mode
-      let changedFiles = [];
-      if (isWrite) {
-        try {
-          const diff = await client.getSessionDiff(sessionId);
-          if (diff?.files) {
-            changedFiles = diff.files.map((f) => f.path || f.name).filter(Boolean);
-          }
-        } catch {
-          // diff endpoint may not be available
+        let sessionId;
+        if (resumeSessionId) {
+          report("starting", `Resuming OpenCode session ${resumeSessionId}...`);
+          sessionId = resumeSessionId;
+        } else {
+          report("starting", "Creating new OpenCode session...");
+          const session = await client.createSession({ title: `Task ${job.id}` });
+          sessionId = session.id;
         }
-      }
+        upsertJob(workspace, { id: job.id, opencodeSessionId: sessionId });
 
-      return {
-        rendered: text,
-        messages: response,
-        changedFiles,
-        summary: text.slice(0, 500),
-      };
-    });
+        const prompt = buildTaskPrompt(taskText, { write: isWrite });
+
+        report("investigating", "Sending task to OpenCode...");
+        log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${options.model ?? "(provider default)"}`);
+
+        const response = await client.sendPrompt(sessionId, prompt, {
+          agent: agentName,
+          model: options.model,
+        });
+
+        report("finalizing", "Processing task output...");
+
+        const text = extractResponseText(response);
+        const usage = await client.getSessionUsage(sessionId).catch(() => null);
+
+        // Get changed files if write mode
+        let changedFiles = [];
+        if (isWrite) {
+          try {
+            const diff = await client.getSessionDiff(sessionId);
+            if (diff?.files) {
+              changedFiles = diff.files.map((f) => f.path || f.name).filter(Boolean);
+            }
+          } catch {
+            // diff endpoint may not be available
+          }
+        }
+
+        return {
+          rendered: text,
+          messages: response,
+          changedFiles,
+          usage,
+          summary: text.slice(0, 500),
+        };
+      }, log));
 
     console.log(result.rendered);
+    const usageLine = formatUsage(result.usage);
+    if (usageLine) console.log(`\n---\n${usageLine}`);
+    if (result.changedFiles?.length) {
+      console.log(`\nChanged files:\n${result.changedFiles.map((f) => `- ${f}`).join("\n")}`);
+    }
   } catch (err) {
     console.error(`Task failed: ${err.message}`);
     process.exit(1);
@@ -371,10 +393,10 @@ async function handleTask(argv) {
 async function handleWaitAndResult(argv) {
   const { options } = parseArgs(argv, {
     valueOptions: ["model", "agent", "timeout-ms"],
-    booleanOptions: ["write", "resume-last", "fresh"],
+    booleanOptions: ["write", "resume-last", "fresh", "worktree"],
   });
   const taskText = extractTaskText(argv, ["model", "agent", "timeout-ms"], [
-    "write", "resume-last", "fresh",
+    "write", "resume-last", "fresh", "worktree",
   ]);
   if (!taskText) {
     console.error("No task text provided.");
@@ -384,6 +406,7 @@ async function handleWaitAndResult(argv) {
   const workspace = await resolveWorkspace();
   const agentName = options.agent ?? "build";
   const isWrite = agentName !== "plan";
+  const useWorktree = !!options.worktree;
 
   let resumeSessionId = null;
   if (options["resume-last"]) {
@@ -407,11 +430,12 @@ async function handleWaitAndResult(argv) {
     "--agent", agentName,
   ];
   if (isWrite) workerArgs.push("--write");
+  if (useWorktree) workerArgs.push("--worktree");
   if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
   if (options.model) workerArgs.push("--model", options.model);
 
   const child = spawnDetached("node", workerArgs, { cwd: workspace });
-  if (child?.pid) upsertJob(workspace, { id: job.id, pid: child.pid });
+  if (child?.pid) upsertJob(workspace, { id: job.id, pid: child.pid, pidStart: pidStartTime(child.pid) });
 
   const timeoutMs = Number(options["timeout-ms"]) > 0
     ? Number(options["timeout-ms"])
@@ -439,19 +463,12 @@ async function handleWaitAndResult(argv) {
     if (printTerminal(st)) return;
 
     // Fail fast if the detached worker died without writing a terminal status.
-    if (st.pid) {
-      let workerGone = false;
-      try {
-        process.kill(st.pid, 0);
-      } catch (e) {
-        workerGone = e.code === "ESRCH";
-      }
-      if (workerGone) {
-        const again = loadState(workspace).jobs?.find((j) => j.id === job.id);
-        if (again && printTerminal(again)) return;
-        console.error(`Task ${job.id} worker (pid ${st.pid}) exited without completing.`);
-        process.exit(1);
-      }
+    // Ownership-aware: a recycled pid (different start-time) counts as gone.
+    if (st.pid && !isOwnedProcessAlive(st.pid, st.pidStart)) {
+      const again = loadState(workspace).jobs?.find((j) => j.id === job.id);
+      if (again && printTerminal(again)) return;
+      console.error(`Task ${job.id} worker (pid ${st.pid}) exited without completing.`);
+      process.exit(1);
     }
   }
 
@@ -465,7 +482,7 @@ async function handleWaitAndResult(argv) {
 async function handleTaskWorker(argv) {
   const { options } = parseArgs(argv, {
     valueOptions: ["job-id", "workspace", "task-text", "agent", "model", "resume-session"],
-    booleanOptions: ["write"],
+    booleanOptions: ["write", "worktree"],
   });
 
   const workspace = options.workspace;
@@ -473,6 +490,7 @@ async function handleTaskWorker(argv) {
   const taskText = options["task-text"];
   const agentName = options.agent ?? "build";
   const isWrite = !!options.write;
+  const useWorktree = !!options.worktree;
   const resumeSessionId = options["resume-session"];
 
   if (!workspace || !jobId || !taskText) {
@@ -480,34 +498,36 @@ async function handleTaskWorker(argv) {
   }
 
   try {
-    await runTrackedJob(workspace, { id: jobId }, async ({ report, log }) => {
-      report("starting", "Background worker connecting to OpenCode...");
-      const client = await connect({ cwd: workspace });
+    await runTrackedJob(workspace, { id: jobId }, async ({ report, log }) =>
+      withWorktree({ dir: workspace, jobId, useWorktree, isWrite }, async (effectiveCwd) => {
+        report("starting", "Background worker connecting to OpenCode...");
+        const client = await connect({ cwd: effectiveCwd });
 
-      let sessionId;
-      if (resumeSessionId) {
-        sessionId = resumeSessionId;
-        report("starting", `Resuming session ${resumeSessionId}...`);
-      } else {
-        const session = await client.createSession({ title: `Task ${jobId}` });
-        sessionId = session.id;
-        report("starting", `Created session ${sessionId}`);
-      }
-      upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId });
+        let sessionId;
+        if (resumeSessionId) {
+          sessionId = resumeSessionId;
+          report("starting", `Resuming session ${resumeSessionId}...`);
+        } else {
+          const session = await client.createSession({ title: `Task ${jobId}` });
+          sessionId = session.id;
+          report("starting", `Created session ${sessionId}`);
+        }
+        upsertJob(workspace, { id: jobId, opencodeSessionId: sessionId });
 
-      const prompt = buildTaskPrompt(taskText, { write: isWrite });
-      report("investigating", "Running task...");
+        const prompt = buildTaskPrompt(taskText, { write: isWrite });
+        report("investigating", "Running task...");
 
-      const response = await client.sendPrompt(sessionId, prompt, {
-        agent: agentName,
-        model: options.model,
-      });
+        const response = await client.sendPrompt(sessionId, prompt, {
+          agent: agentName,
+          model: options.model,
+        });
 
-      const text = extractResponseText(response);
-      report("finalizing", "Done");
+        const text = extractResponseText(response);
+        const usage = await client.getSessionUsage(sessionId).catch(() => null);
+        report("finalizing", "Done");
 
-      return { rendered: text, summary: text.slice(0, 500) };
-    });
+        return { rendered: text, usage, summary: text.slice(0, 500) };
+      }, log));
   } catch (err) {
     // Error is already logged by runTrackedJob
     process.exit(1);
@@ -632,22 +652,16 @@ async function handleCancel(argv) {
     }
   }
 
-  // Kill the worker if its pid is still alive AND still owned by this job
-  // (guards against signalling an unrelated process that recycled the pid).
-  if (job.pid) {
-    let alive = false;
+  // Kill the worker only if its pid is still alive AND still the process we
+  // spawned. isOwnedProcessAlive compares the recorded kernel start-time
+  // fingerprint, so a pid recycled by an unrelated process is not signalled.
+  // (When the fingerprint is unavailable — non-Linux — it degrades to a bare
+  // liveness check, matching the old best-effort behavior.)
+  if (job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
     try {
-      process.kill(job.pid, 0);
-      alive = true;
-    } catch (e) {
-      alive = e.code === "EPERM";
-    }
-    if (alive) {
-      try {
-        process.kill(job.pid, "SIGTERM");
-      } catch {
-        // race: gone between the liveness check and the signal
-      }
+      process.kill(job.pid, "SIGTERM");
+    } catch {
+      // race: gone between the liveness check and the signal
     }
   }
 

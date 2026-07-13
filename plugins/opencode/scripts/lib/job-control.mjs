@@ -1,5 +1,6 @@
 // Job control: query, sort, enrich, and build status snapshots.
 
+import fs from "node:fs";
 import { tailLines } from "./fs.mjs";
 import { jobLogPath, upsertJob, loadState } from "./state.mjs";
 
@@ -18,6 +19,49 @@ function isPidAlive(pid) {
 }
 
 /**
+ * Read a process's kernel start-time (jiffies since boot, field 22 of
+ * /proc/<pid>/stat) as an ownership fingerprint. Two processes with the same
+ * pid but different start-times are NOT the same process — this is how we tell
+ * "our worker" apart from an unrelated process that later recycled the pid.
+ * Linux-only; returns null when /proc is unavailable or unreadable.
+ * @param {number} pid
+ * @returns {string|null}
+ */
+export function pidStartTime(pid) {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The comm field (field 2) is parenthesized and may contain spaces/parens;
+    // split on the LAST ")" so the remaining fields align to their numbers.
+    const rparen = stat.lastIndexOf(")");
+    if (rparen < 0) return null;
+    const rest = stat.slice(rparen + 2).split(" ");
+    // After comm, field 3 (state) is rest[0]; starttime is field 22 ⇒ rest[19].
+    const starttime = rest[19];
+    return starttime && /^\d+$/.test(starttime) ? starttime : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `pid` is alive AND (when both fingerprints are known) still the same
+ * process we spawned. If start-times are known and differ, the pid was recycled
+ * by an unrelated process — treat as NOT ours so we never signal it. When a
+ * fingerprint is unavailable (non-Linux, or none was captured), falls back to a
+ * bare liveness check.
+ * @param {number} pid
+ * @param {string|null|undefined} expectedStart
+ * @returns {boolean}
+ */
+export function isOwnedProcessAlive(pid, expectedStart) {
+  if (!isPidAlive(pid)) return false;
+  const current = pidStartTime(pid);
+  if (expectedStart && current) return current === expectedStart;
+  return true; // can't fingerprint ⇒ best-effort liveness only
+}
+
+/**
  * Reconcile jobs whose worker process is gone but whose status is still
  * non-terminal — they were stranded (SIGKILL/OOM/reboot before runTrackedJob
  * could mark them). Marks them failed so status/result/cancel stop showing a
@@ -26,17 +70,39 @@ function isPidAlive(pid) {
  * @param {object[]} jobs
  * @returns {object[]}
  */
+const PENDING_STALE_MS = 60_000;
+
 export function reconcileStrandedJobs(workspacePath, jobs) {
   let changed = false;
+  const now = Date.now();
   for (const j of jobs ?? []) {
     const terminal = j.status === "completed" || j.status === "failed" || j.status === "canceled";
-    if (terminal || !j.pid) continue;
-    if (!isPidAlive(j.pid)) {
+    if (terminal) continue;
+
+    let reason = null;
+    if (j.pid) {
+      // Known worker pid that is no longer alive (or was recycled by an
+      // unrelated process) ⇒ our worker died mid-run.
+      if (!isOwnedProcessAlive(j.pid, j.pidStart)) {
+        reason = `Worker process (pid ${j.pid}) exited without completing.`;
+      }
+    } else {
+      // No worker pid was ever recorded. If it has been non-terminal for a
+      // while, the worker never started (spawn failed / parent died) — it
+      // would otherwise show as a phantom "pending" job forever.
+      const t = new Date(j.updatedAt || j.createdAt || 0).getTime();
+      const age = now - t;
+      if (Number.isFinite(age) && age > PENDING_STALE_MS) {
+        reason = `No worker process ever started (stranded ${Math.round(age / 1000)}s).`;
+      }
+    }
+
+    if (reason) {
       upsertJob(workspacePath, {
         id: j.id,
         status: "failed",
         completedAt: new Date().toISOString(),
-        errorMessage: `Worker process (pid ${j.pid}) exited without completing.`,
+        errorMessage: reason,
       });
       changed = true;
     }
@@ -98,19 +164,14 @@ export function enrichJob(job, workspacePath) {
 function inferPhase(job, workspacePath) {
   const logFile = jobLogPath(workspacePath, job.id);
   const lines = tailLines(logFile, 20);
-  const text = lines.join("\n").toLowerCase();
-
-  // NOTE: a running job is never "failed" here — a genuinely failed job has
-  // status "failed" (set by runTrackedJob) and doesn't reach inferPhase. We
-  // must NOT infer "failed" from the word "error"/"failed" appearing in a log
-  // line like "checking for errors... none found", which would mislabel a
-  // healthy running job as crashed.
-  if (text.includes("finalizing") || text.includes("complete")) return "finalizing";
-  if (text.includes("editing") || text.includes("writing")) return "editing";
-  if (text.includes("verifying") || text.includes("testing")) return "verifying";
-  if (text.includes("investigating") || text.includes("analyzing")) return "investigating";
-  if (text.includes("reviewing")) return "reviewing";
-  if (text.includes("starting") || text.includes("initializing")) return "starting";
+  // report() writes lines shaped "[<iso-time>] [<phase>] <message>". Read the
+  // phase from the most recent such line rather than fuzzy-matching free text —
+  // keyword matching misclassifies benign model progress notes (e.g. a line
+  // mentioning "writing tests" or "no errors" would flip the phase wrongly).
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^\[[^\]]+\]\s+\[([^\]]+)\]/);
+    if (m) return m[1];
+  }
   return "running";
 }
 
