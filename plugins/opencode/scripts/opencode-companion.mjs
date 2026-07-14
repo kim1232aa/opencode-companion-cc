@@ -8,17 +8,17 @@ import path from "node:path";
 import process from "node:process";
 import fs from "node:fs";
 
-import { parseArgs, extractTaskText } from "./lib/args.mjs";
+import { parseArgs, parseTaskArgv, classifyWaitTarget } from "./lib/args.mjs";
 import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/process.mjs";
 import { isServerRunning, createClient, connect, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
-import { loadState, updateState, upsertJob, jobDataPath } from "./lib/state.mjs";
-import { buildStatusSnapshot, resolveResultJob, resolveCancelableJobs, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
-import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled } from "./lib/tracked-jobs.mjs";
+import { loadState, updateState, upsertJob, jobDataPath, jobLogPath } from "./lib/state.mjs";
+import { buildStatusSnapshot, resolveResultJob, resolveCancelableJobs, matchJobReference, enrichJob, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
+import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled, recordJobRequest, readJobRequest } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, formatUsage, formatTrailer } from "./lib/render.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
-import { readJson } from "./lib/fs.mjs";
+import { readJson, appendLine } from "./lib/fs.mjs";
 
 const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
 
@@ -82,17 +82,171 @@ const handlers = {
   cancel: handleCancel,
 };
 
+// Flags that route the run; everything else on task-style commands is TASK TEXT.
+// `task`/`prompt`/`task-file` are ACCEPTED sources for the task text (so the
+// natural `--task "…"` spelling works instead of exploding), on top of the
+// positional form and piped stdin.
+const TASK_VALUE_OPTIONS = ["model", "agent", "task", "prompt", "task-file"];
+const TASK_BOOLEAN_OPTIONS = ["write", "background", "wait", "resume-last", "fresh", "worktree"];
+const WAIT_VALUE_OPTIONS = [...TASK_VALUE_OPTIONS, "timeout-ms"];
+const WAIT_BOOLEAN_OPTIONS = ["write", "resume-last", "fresh", "worktree"];
+
+const USAGE = `opencode-companion — delegate tasks and reviews to OpenCode.
+
+Usage: opencode-companion <subcommand> [options] [task text...]
+
+DISPATCH vs. RETRIEVE:
+  task / wait-and-result   dispatch work (they create a job)
+  status / result / cancel act on an EXISTING job id — they never dispatch
+
+The task text is POSITIONAL (plain words). It may also be given with
+--task/--prompt, with --task-file <path>, or piped on stdin. An undeclared
+--flag inside the text is forwarded verbatim (e.g. git commit --no-verify).
+
+Subcommands:
+  task [options] <task text...>
+      Dispatch a task. Blocks and prints the result unless --background.
+      --background            spawn a detached worker, print the job id, return now
+      --task/--prompt <text>  task text as an option instead of positional words
+      --task-file <path>      read the task text from a file ("-" = stdin)
+      --model <provider/model>  model ref (e.g. anthropic/claude-sonnet-4-5)
+      --agent <build|plan>    build = can write (default), plan = read-only
+      --worktree              run writes in an isolated git worktree
+      --resume-last | --fresh continue this session's last OpenCode session / force a new one
+
+  wait-and-result [options] <task text... | existing job id>
+      With TASK TEXT: dispatch a NEW job on a tracked detached worker and BLOCK
+      until it finishes, then print the full result.
+      With an existing JOB ID: wait for THAT job and print its result — nothing
+      new is dispatched. An unknown job id is an error (use \`result <id>\`).
+      --timeout-ms <ms>       max wait (default 35m; OPENCODE_COMPANION_WAIT_TIMEOUT_MS)
+      plus every \`task\` option except --background.
+
+  status [<job id>] [--wait] [--timeout-ms <ms>]
+      No id: list this session's jobs. With an id: show that job.
+      --wait blocks until that job reaches a terminal state (requires a job id).
+  result [<job id or prefix>]            print a finished job's result (never dispatches)
+  cancel [<job id or prefix>]            cancel one job / all of this session's
+  review [--base <ref>] [--model <ref>]  review the working diff
+  adversarial-review [--base <ref>] [--model <ref>] [focus text...]
+  setup [--json] [--enable-review-gate|--disable-review-gate]
+  task-resume-candidate [--json]         report a resumable session
+  task-worker --job-id <id> --workspace <dir>            (internal; reads the job's request file)
+
+Task text and dashes:
+  A task text that starts with a dashed word is fine — quote it as ONE argument
+  ("--no-verify 这参数啥意思"), pass it with --task, or put it after \`--\`:
+      task -- --no-verify what does this flag do?
+  Dispatch fails fast only when the task text ends up EMPTY.
+
+Env: OPENCODE_SERVER_PORT, OPENCODE_COMPANION_DATA, OPENCODE_COMPANION_WAIT_TIMEOUT_MS,
+     OPENCODE_COMPANION_VERBOSE_TRAILER`;
+
+function printUsage(stream = process.stdout) {
+  stream.write(`${USAGE}\n`);
+}
+
+if (!subcommand || subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
+  printUsage();
+  process.exit(0);
+}
+
 const handler = handlers[subcommand];
 if (!handler) {
   console.error(`Unknown subcommand: ${subcommand}`);
-  console.error(`Available: ${Object.keys(handlers).join(", ")}`);
+  console.error(`Available: ${Object.keys(handlers).join(", ")}\n`);
+  printUsage(process.stderr);
   process.exit(1);
+}
+
+if (argv[0] === "--help" || argv[0] === "-h") {
+  printUsage();
+  process.exit(0);
 }
 
 handler(argv).catch((err) => {
   console.error(`Error in ${subcommand}: ${err.message}`);
   process.exit(1);
 });
+
+/**
+ * Read piped stdin, if and only if stdin really is a pipe or a redirected file.
+ * (A TTY or /dev/null must never be read — that would block or return junk.)
+ * @returns {string}
+ */
+function readStdinIfPiped() {
+  if (process.stdin.isTTY) return "";
+  try {
+    const st = fs.fstatSync(0);
+    if (!st.isFIFO() && !st.isFile()) return "";
+    return fs.readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Resolve the task text from every accepted source, in priority order:
+ *   --task-file <path>  (or "-" for stdin) > --task/--prompt > positional words > piped stdin
+ * Accepting `--task` is deliberate: a user writing
+ * `task --background --model … --task "中文任务"` gets the task they asked for
+ * instead of a mangled/empty one.
+ * @param {Record<string, string|boolean>} options
+ * @param {string} positionalText
+ * @returns {{ taskText: string, errors: string[] }}
+ */
+function resolveTaskText(options, positionalText) {
+  const errors = [];
+  const optionText = options.task ?? options.prompt;
+  const file = options["task-file"];
+
+  const sources = [];
+  if (file) sources.push("--task-file");
+  if (typeof optionText === "string" && optionText.trim()) sources.push("--task/--prompt");
+  if (positionalText) sources.push("positional text");
+  if (sources.length > 1) {
+    process.stderr.write(`[opencode] several task sources given (${sources.join(", ")}); using ${sources[0]}.\n`);
+  }
+
+  if (file) {
+    if (file === "-") return { taskText: readStdinIfPiped().trim(), errors };
+    try {
+      return { taskText: fs.readFileSync(path.resolve(process.cwd(), String(file)), "utf8").trim(), errors };
+    } catch (err) {
+      errors.push(`could not read --task-file ${file}: ${err.message}`);
+      return { taskText: "", errors };
+    }
+  }
+  if (typeof optionText === "string" && optionText.trim()) {
+    return { taskText: optionText.trim(), errors };
+  }
+  if (positionalText) return { taskText: positionalText, errors };
+
+  return { taskText: readStdinIfPiped().trim(), errors };
+}
+
+/**
+ * Fail fast on an invocation that has no usable task — BEFORE a job record
+ * exists or a worker is spawned. The old code only warned and ran anyway, which
+ * burned a whole delegation on an empty task and then reported it, minutes
+ * later, as a mysterious "worker exited without completing".
+ * @param {string[]} errors
+ * @param {string} taskText
+ */
+function requireValidTaskArgs(errors, taskText) {
+  const problems = [...errors];
+  if (!taskText || !taskText.trim()) problems.push("no task text provided");
+  if (!problems.length) return;
+
+  console.error(`Invalid arguments for \`${subcommand}\`:`);
+  for (const p of problems) console.error(`  - ${p}`);
+  console.error("");
+  console.error("Give the task as positional words, with --task/--prompt, with --task-file <path>, or on piped stdin:");
+  console.error(`  ${subcommand} --background --model openai/gpt-5 "重构 X 模块"`);
+  console.error(`  ${subcommand} --background --model openai/gpt-5 --task "重构 X 模块"`);
+  console.error(`\nRun \`${subcommand} --help\` for the full usage.`);
+  process.exit(1);
+}
 
 // ------------------------------------------------------------------
 // Setup
@@ -290,19 +444,15 @@ async function handleAdversarialReview(argv) {
 // ------------------------------------------------------------------
 
 async function handleTask(argv) {
-  const { options, positional } = parseArgs(argv, {
-    valueOptions: ["model", "agent"],
-    booleanOptions: ["write", "background", "wait", "resume-last", "fresh", "worktree"],
+  const { options, taskText: positionalText, errors } = parseTaskArgv(argv, {
+    valueOptions: TASK_VALUE_OPTIONS,
+    booleanOptions: TASK_BOOLEAN_OPTIONS,
   });
+  const resolved = resolveTaskText(options, positionalText);
+  const taskText = resolved.taskText;
 
-  const taskText = extractTaskText(argv, ["model", "agent"], [
-    "write", "background", "wait", "resume-last", "fresh", "worktree",
-  ]);
-
-  if (!taskText) {
-    console.error("No task text provided.");
-    process.exit(1);
-  }
+  // Empty/unusable task ⇒ stop here: no job record, no worker, no burned call.
+  requireValidTaskArgs([...errors, ...resolved.errors], taskText);
 
   const workspace = await resolveWorkspace();
   // parseArgs can only ever produce options.write === true or undefined
@@ -328,25 +478,20 @@ async function handleTask(argv) {
     }
   }
 
+  // createJobRecord persists the task text into the job's REQUEST FILE (0600),
+  // so the worker is spawned with nothing but a job id.
   const job = createJobRecord(workspace, "task", {
     agent: agentName,
     resumeSessionId,
+    model: options.model,
+    write: isWrite,
+    worktree: useWorktree,
+    taskText,
   });
 
   // Background mode: spawn a detached worker
   if (options.background) {
-    const workerArgs = [
-      path.join(PLUGIN_ROOT, "scripts", "opencode-companion.mjs"),
-      "task-worker",
-      "--job-id", job.id,
-      "--workspace", workspace,
-      "--task-text", taskText,
-      "--agent", agentName,
-    ];
-    if (isWrite) workerArgs.push("--write");
-    if (useWorktree) workerArgs.push("--worktree");
-    if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
-    if (options.model) workerArgs.push("--model", options.model);
+    const workerArgs = buildWorkerArgs({ jobId: job.id, workspace });
 
     const bgChild = spawnDetached("node", workerArgs, { cwd: workspace });
     if (!bgChild?.pid) {
@@ -424,26 +569,68 @@ async function handleTask(argv) {
   }
 }
 
+/**
+ * Build the argv for a detached task-worker. The worker gets ONLY a job id and
+ * workspace: the task text and routing live in the job's request file (0600).
+ * Nothing sensitive is on the command line (`ps` / /proc/<pid>/cmdline), and an
+ * option-shaped task text ("--task 中文任务") can no longer be eaten by the
+ * worker's own arg parser — the bug that made the worker start with an EMPTY
+ * task and die before its first log line.
+ * @param {{ jobId: string, workspace: string }} spec
+ * @returns {string[]}
+ */
+function buildWorkerArgs({ jobId, workspace }) {
+  return [
+    path.join(PLUGIN_ROOT, "scripts", "opencode-companion.mjs"),
+    "task-worker",
+    "--job-id", jobId,
+    "--workspace", workspace,
+  ];
+}
+
 // Dispatch a task on a detached worker (so it is tracked, survivable, and
 // visible to status/result/cancel) but BLOCK until it reaches a terminal
 // state and then print the full result. This is the reliable "delegate AND
 // get the result back in one call" path — the caller never has to poll a
 // job-id or guess which session/cwd the result landed under (the exact pain
 // that made background review results so hard to collect).
+//
+// It ALSO accepts an existing job id, in which case it waits for that job and
+// dispatches nothing (the name finally matches the behavior).
 async function handleWaitAndResult(argv) {
-  const { options } = parseArgs(argv, {
-    valueOptions: ["model", "agent", "timeout-ms"],
-    booleanOptions: ["write", "resume-last", "fresh", "worktree"],
+  const { options, taskText: positionalText, errors } = parseTaskArgv(argv, {
+    valueOptions: WAIT_VALUE_OPTIONS,
+    booleanOptions: WAIT_BOOLEAN_OPTIONS,
   });
-  const taskText = extractTaskText(argv, ["model", "agent", "timeout-ms"], [
-    "write", "resume-last", "fresh", "worktree",
-  ]);
-  if (!taskText) {
-    console.error("No task text provided.");
+  const resolved = resolveTaskText(options, positionalText);
+  const taskText = resolved.taskText;
+  requireValidTaskArgs([...errors, ...resolved.errors], taskText);
+
+  const workspace = await resolveWorkspace();
+  const timeoutMs = resolveTimeoutMs(options["timeout-ms"]);
+
+  // Is the argument an EXISTING job rather than task text? It used to be taken
+  // as task text unconditionally: `wait-and-result task-abc-123` dispatched a
+  // NEW job whose task was that opaque id, which then hunted the repo for the
+  // string and hung asking what the task was.
+  const target = classifyWaitTarget(taskText, loadState(workspace).jobs ?? []);
+
+  if (target.kind === "await") {
+    process.stderr.write(`[opencode] waiting for EXISTING job ${target.jobId}; dispatching nothing.\n`);
+    await awaitJobResult(workspace, target.jobId, timeoutMs);
+    return;
+  }
+
+  if (target.kind === "missing") {
+    console.error(
+      target.ambiguous
+        ? `Ambiguous job reference "${target.jobId}" — several jobs share that prefix. Pass the full job id.`
+        : `No such job: ${target.jobId}. Did you mean \`result ${target.jobId}\`? (Check \`status\` for live job ids.)`
+    );
+    console.error("Refusing to dispatch a job id as task text. To dispatch a NEW task, pass the task text as plain words.");
     process.exit(1);
   }
 
-  const workspace = await resolveWorkspace();
   const agentName = options.agent ?? "build";
   const isWrite = agentName !== "plan";
   const useWorktree = !!options.worktree;
@@ -459,26 +646,25 @@ async function handleWaitAndResult(argv) {
     if (lastTask?.opencodeSessionId) resumeSessionId = lastTask.opencodeSessionId;
   }
 
-  const job = createJobRecord(workspace, "task", { agent: agentName, resumeSessionId });
+  const job = createJobRecord(workspace, "task", {
+    agent: agentName,
+    resumeSessionId,
+    model: options.model,
+    write: isWrite,
+    worktree: useWorktree,
+    taskText,
+  });
 
-  const workerArgs = [
-    path.join(PLUGIN_ROOT, "scripts", "opencode-companion.mjs"),
-    "task-worker",
-    "--job-id", job.id,
-    "--workspace", workspace,
-    "--task-text", taskText,
-    "--agent", agentName,
-  ];
-  if (isWrite) workerArgs.push("--write");
-  if (useWorktree) workerArgs.push("--worktree");
-  if (resumeSessionId) workerArgs.push("--resume-session", resumeSessionId);
-  if (options.model) workerArgs.push("--model", options.model);
+  const workerArgs = buildWorkerArgs({ jobId: job.id, workspace });
+
+  // Say plainly that this is a NEW dispatch, so a caller who *meant* to wait on
+  // an existing job sees immediately that it isn't what happened.
+  process.stderr.write(`[opencode] dispatching a NEW job for the given task text (not waiting on an existing job).\n`);
 
   const child = spawnDetached("node", workerArgs, { cwd: workspace });
   if (!child?.pid) {
-    // Spawn failed (e.g. node missing, ARG_MAX exceeded by a huge task-text).
-    // Without a pid the polling loop can't detect the dead worker and would
-    // block for the full timeout — fail fast instead.
+    // Spawn failed (e.g. node missing). Without a pid the polling loop can't
+    // detect the dead worker and would block for the full timeout — fail fast.
     const msg = "Failed to start the OpenCode worker process.";
     upsertJob(workspace, { id: job.id, status: "failed", completedAt: new Date().toISOString(), errorMessage: msg });
     console.error(`Task ${job.id}: ${msg}`);
@@ -492,34 +678,42 @@ async function handleWaitAndResult(argv) {
   // so the result can be recovered later with `result <id>` instead of lost.
   process.stderr.write(`[opencode] job ${job.id} dispatched; blocking until it finishes. If this call is cut off, retrieve the result later with: result ${job.id}\n`);
 
-  const timeoutMs = Number(options["timeout-ms"]) > 0
-    ? Number(options["timeout-ms"])
+  await awaitJobResult(workspace, job.id, timeoutMs);
+}
+
+const TERMINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
+
+/**
+ * Resolve the wait budget for the blocking paths.
+ * @param {string|boolean|undefined} raw
+ * @returns {number}
+ */
+function resolveTimeoutMs(raw) {
+  return Number(raw) > 0
+    ? Number(raw)
     : Number(process.env.OPENCODE_COMPANION_WAIT_TIMEOUT_MS) || 35 * 60 * 1000;
+}
+
+/**
+ * Poll an EXISTING tracked job until it reaches a terminal state. Shared by
+ * `wait-and-result` (both of its branches) and `status <job-id> --wait`.
+ * @param {string} workspace
+ * @param {string} jobId
+ * @param {number} timeoutMs
+ * @returns {Promise<object|null>} the terminal job record, or null on timeout
+ */
+async function waitForTerminalJob(workspace, jobId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   const POLL_MS = 1500;
 
-  const printTerminal = (st) => {
-    if (st.status === "completed") {
-      const data = readJson(jobDataPath(workspace, job.id));
-      console.log(data?.rendered ?? st.result ?? "(task completed with no output)");
-      printTrailer(data?.usage, {
-        requestedModel: data?.requestedModel,
-        sessionId: data?.opencodeSessionId ?? st.opencodeSessionId,
-      });
-      return true;
-    }
-    if (st.status === "failed") {
-      console.error(`Task ${job.id} failed: ${st.errorMessage ?? "unknown error"}`);
-      process.exit(1);
-    }
-    return false;
-  };
+  const initial = loadState(workspace).jobs?.find((j) => j.id === jobId);
+  if (initial && TERMINAL_STATUSES.has(initial.status)) return initial;
 
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, POLL_MS));
-    const st = loadState(workspace).jobs?.find((j) => j.id === job.id);
+    const st = loadState(workspace).jobs?.find((j) => j.id === jobId);
     if (!st) continue;
-    if (printTerminal(st)) return;
+    if (TERMINAL_STATUSES.has(st.status)) return st;
 
     // The detached worker died without writing a terminal status. Before giving
     // up, try to salvage the result from the server — the session often finished
@@ -530,39 +724,136 @@ async function handleWaitAndResult(argv) {
         loadState(workspace).jobs ?? [],
         defaultServerUrl()
       );
-      const again = healed.find((j) => j.id === job.id);
-      if (again && printTerminal(again)) return;
+      const again = healed.find((j) => j.id === jobId);
+      if (again && TERMINAL_STATUSES.has(again.status)) return again;
       // Server still generating our answer ⇒ keep waiting instead of failing.
       if (again?.awaitingServer) continue;
-      console.error(`Task ${job.id} worker (pid ${st.pid}) exited without completing.`);
-      process.exit(1);
+      const dead = again ?? st;
+      return {
+        ...dead,
+        status: "failed",
+        errorMessage: dead.errorMessage ?? `worker (pid ${st.pid}) exited without completing`,
+      };
     }
   }
+  return null;
+}
 
-  console.error(
-    `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${job.id}. ` +
-    `It may still finish — check \`/opencode:status\` and \`/opencode:result ${job.id}\`.`
-  );
+/**
+ * Wait for a job and print its RESULT. Exits the process on failure/cancel/timeout.
+ * @param {string} workspace
+ * @param {string} jobId
+ * @param {number} timeoutMs
+ */
+async function awaitJobResult(workspace, jobId, timeoutMs) {
+  const st = await waitForTerminalJob(workspace, jobId, timeoutMs);
+
+  if (!st) {
+    console.error(
+      `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${jobId}. ` +
+      `It may still finish — check \`/opencode:status\` and \`/opencode:result ${jobId}\`.`
+    );
+    process.exit(1);
+  }
+
+  if (st.status === "completed") {
+    const data = readJson(jobDataPath(workspace, jobId));
+    console.log(data?.rendered ?? st.result ?? "(task completed with no output)");
+    printTrailer(data?.usage, {
+      requestedModel: data?.requestedModel ?? st.requestedModel,
+      sessionId: data?.opencodeSessionId ?? st.opencodeSessionId,
+    });
+    return;
+  }
+
+  if (st.status === "canceled") {
+    console.error(`Task ${jobId} was canceled.`);
+    process.exit(1);
+  }
+
+  console.error(`Task ${jobId} failed: ${st.errorMessage ?? "unknown error"}`);
+  process.exit(1);
+}
+
+/**
+ * Abort a worker that was started with unusable arguments. The old worker just
+ * called process.exit(1) BEFORE writing any log line, so the job had no .log at
+ * all and only surfaced ~4.5 min later as a misleading "Worker process exited
+ * without completing". Now: log the real reason first, then mark the job failed
+ * with that reason as its errorMessage.
+ * @param {string|undefined} workspace
+ * @param {string|undefined} jobId
+ * @param {string[]} problems
+ */
+function failWorkerStartup(workspace, jobId, problems) {
+  const reason = problems.join("; ");
+  const line = `[${new Date().toISOString()}] [failed] task-worker startup aborted: ${reason}`;
+  process.stderr.write(`${line}\n`);
+
+  if (workspace && jobId) {
+    try {
+      appendLine(jobLogPath(workspace, jobId), line);
+    } catch { /* state dir unwritable — the stderr line above is still the record */ }
+    try {
+      updateState(workspace, (state) => {
+        const j = state.jobs?.find((x) => x.id === jobId);
+        if (!j) return;
+        if (j.status !== "running" && j.status !== "pending") return; // already terminal
+        j.status = "failed";
+        j.completedAt = new Date().toISOString();
+        j.errorMessage = reason;
+        j.updatedAt = new Date().toISOString();
+      });
+    } catch { /* best effort */ }
+  }
   process.exit(1);
 }
 
 async function handleTaskWorker(argv) {
   const { options } = parseArgs(argv, {
-    valueOptions: ["job-id", "workspace", "task-text", "agent", "model", "resume-session"],
+    valueOptions: ["job-id", "workspace", "task-file", "task-text", "agent", "model", "resume-session"],
     booleanOptions: ["write", "worktree"],
   });
 
   const workspace = options.workspace;
   const jobId = options["job-id"];
-  const taskText = options["task-text"];
-  const agentName = options.agent ?? "build";
-  const isWrite = !!options.write;
-  const useWorktree = !!options.worktree;
-  const resumeSessionId = options["resume-session"];
 
-  if (!workspace || !jobId || !taskText) {
-    process.exit(1);
+  // Validate BEFORE anything else, and never start on an empty task.
+  const problems = [];
+  if (!workspace) problems.push("missing --workspace");
+  if (!jobId) problems.push("missing --job-id");
+  if (problems.length) failWorkerStartup(workspace, jobId, problems);
+
+  // The task text and routing come from the job's request file — argv carries
+  // only the job id. The legacy argv transports are still honored so an older
+  // caller (or a hand-run worker) keeps working.
+  const request = readJobRequest(workspace, jobId) ?? {};
+  let taskText = typeof request.taskText === "string" ? request.taskText : "";
+  if (!taskText && options["task-file"]) {
+    try {
+      taskText = fs.readFileSync(String(options["task-file"]), "utf8");
+    } catch (err) {
+      problems.push(`could not read --task-file ${options["task-file"]}: ${err.message}`);
+    }
   }
+  if (!taskText && typeof options["task-text"] === "string") {
+    taskText = options["task-text"];
+  }
+
+  const agentName = options.agent ?? request.agent ?? "build";
+  const isWrite = options.write ?? (request.write ?? agentName !== "plan");
+  const useWorktree = !!(options.worktree ?? request.worktree);
+  const resumeSessionId = options["resume-session"] ?? request.resumeSessionId ?? null;
+  options.model = options.model ?? request.model;
+
+  if (!problems.length && !taskText.trim()) {
+    problems.push("empty task text — nothing to dispatch");
+  }
+  if (problems.length) failWorkerStartup(workspace, jobId, problems);
+
+  // Persist what this worker was actually asked to do, so a post-mortem can
+  // answer "which model / which task was this?" from state alone.
+  recordJobRequest(workspace, jobId, { model: options.model, taskText });
 
   try {
     await runTrackedJob(workspace, { id: jobId }, async ({ report, log }) =>
@@ -633,6 +924,22 @@ async function handleTaskResumeCandidate(argv) {
 // ------------------------------------------------------------------
 
 async function handleStatus(argv) {
+  const { options, positional } = parseArgs(argv, {
+    valueOptions: ["timeout-ms"],
+    booleanOptions: ["wait"],
+  });
+  const ref = positional[0];
+  if (ref && !isSafeJobRef(ref)) {
+    console.error("Invalid job reference. Use a job ID or safe ID prefix.");
+    process.exit(1);
+  }
+  // Never guess which job to wait for — an unscoped `--wait` would silently
+  // block on the wrong job.
+  if (options.wait && !ref) {
+    console.error("`status --wait` requires a job id. Run `status` to list jobs, then `status <job-id> --wait`.");
+    process.exit(1);
+  }
+
   const workspace = await resolveWorkspace();
   const sessionId = getClaudeSessionId();
 
@@ -643,6 +950,38 @@ async function handleStatus(argv) {
   let jobs = loadState(workspace).jobs ?? [];
   jobs = await recoverStrandedResults(workspace, jobs, defaultServerUrl());
   jobs = reconcileStrandedJobs(workspace, jobs);
+
+  if (ref) {
+    const { job, ambiguous } = matchJobReference(jobs, ref);
+    if (ambiguous) {
+      console.error("Ambiguous job reference. Please provide a more specific ID prefix.");
+      process.exit(1);
+    }
+    if (!job) {
+      console.error(`No such job: ${ref}. Run \`status\` to list jobs.`);
+      process.exit(1);
+    }
+
+    if (options.wait) {
+      process.stderr.write(`[opencode] waiting for job ${job.id} to finish...\n`);
+      const timeoutMs = resolveTimeoutMs(options["timeout-ms"]);
+      const terminal = await waitForTerminalJob(workspace, job.id, timeoutMs);
+      if (!terminal) {
+        console.error(
+          `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for ${job.id}. ` +
+          `It may still finish — check \`status ${job.id}\`.`
+        );
+        process.exit(1);
+      }
+      const fresh = loadState(workspace).jobs?.find((j) => j.id === job.id) ?? terminal;
+      console.log(renderStatus(buildStatusSnapshot([fresh], workspace, {})));
+      console.log(`\nRetrieve the full output with: result ${job.id}`);
+      return;
+    }
+
+    console.log(renderStatus(buildStatusSnapshot([job], workspace, {})));
+    return;
+  }
 
   const snapshot = buildStatusSnapshot(jobs, workspace, { sessionId });
   console.log(renderStatus(snapshot));

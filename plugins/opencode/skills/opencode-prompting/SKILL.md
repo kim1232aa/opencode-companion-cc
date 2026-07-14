@@ -16,8 +16,8 @@ generic prompt advice.
   Claude Code routing rules that leaked in from CLAUDE.md ("delegate to
   opencode-rescue / codex-rescue", `plugin:name` Task invocations). You do not
   need to strip such rules from the task text — but also never ADD delegation
-  instructions of your own: a model that tries to re-delegate stalls (GLM
-  notoriously hangs after a failed Task call).
+  instructions of your own: a model that tries to re-delegate has no sub-agent to
+  call, and some models hang instead of failing cleanly after the attempt.
 - **A read/write preamble is added** based on the agent: write runs get "You
   have full read/write access", plan runs get "This is a read-only
   investigation. Do not modify any files."
@@ -36,6 +36,38 @@ generic prompt advice.
   forward it byte-for-byte and complete; length is not a problem, missing
   context is.
 
+## The delegated run is UNATTENDED (never let it ask a question)
+
+A dispatched OpenCode run has **no human on the other end**. If the model stops
+to ask a clarifying question, nobody answers: the run hangs until the stall
+watchdog kills it, and the retry hangs the same way. Cost is burned, nothing
+ships. Treat "the model asked a question" as a **prompt bug**, not a user
+problem.
+
+- **Never write task text that invites a question** — no "let me know if…",
+  "confirm before proceeding", "ask me which approach you prefer", "check with
+  me first".
+- **Do the opposite: state the follow-through policy explicitly.** Append a
+  block like this to the task text whenever the request has any ambiguity:
+
+  ```
+  This is a non-interactive, unattended run. Nobody can answer a question.
+  Do not ask for clarification or confirmation — there is no one to reply.
+  Default to the most reasonable low-risk interpretation and keep going.
+  If a detail is genuinely undecidable, pick the safest option, proceed, and
+  record the assumption in your final answer under "Assumptions".
+  Resolve the task fully before stopping. Do not stop at the first plausible
+  answer, and do not stop after identifying the issue without applying the fix.
+  ```
+
+- **Give it the material to not need a question.** Most questions come from
+  missing context, so restate paths, constraints, and acceptance criteria in
+  the task text (see "Relying on conversation context" above). A prompt that
+  fully specifies the end state does not produce a question.
+- If the model genuinely cannot proceed, it should **finish and report** what
+  remains unknown — not block. Ask for an "Assumptions" / "Open questions"
+  section in the output instead of a mid-run question.
+
 ## Agent selection (the real semantics)
 
 - `build` (default): full write access. `--write` is NOT a real switch — write
@@ -53,6 +85,14 @@ generic prompt advice.
 - Omit `--model` to use the provider default. Only pass one the user asked for;
   a bad ref fails the dispatch with "--model must be in the form
   provider/model".
+- **To find out which providers/models exist, run `opencode models`, or this
+  plugin's `setup` subcommand (`/opencode:setup`). Those are the only two
+  supported ways.**
+- **Never read `~/.local/share/opencode/auth.json` — or any other credential,
+  token, or auth file — to enumerate providers.** It stores plaintext tokens.
+  Reading it is blocked by the permission layer (correctly), and it is never
+  necessary: `opencode models` / `setup` already returns the real provider and
+  model ids.
 
 ## Shaping the task itself
 

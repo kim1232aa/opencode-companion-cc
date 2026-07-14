@@ -17,8 +17,6 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
   the detached worker). Children need `PATH`/`HOME`, so a blanket allowlist is
   intrusive; the delegated model can, in principle, read the parent environment.
   Only delegate to backends you trust.
-- **Task text is passed on the worker command line** (visible via `ps` /
-  `/proc/<pid>/cmdline` to other local users on a shared machine).
 - **Basic auth over loopback HTTP** when `OPENCODE_SERVER_PASSWORD` is set — safe
   on localhost, capturable only by a root-level packet sniffer on the same host.
 

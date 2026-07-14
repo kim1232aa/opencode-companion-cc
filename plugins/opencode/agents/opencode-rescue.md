@@ -38,6 +38,7 @@ Forwarding rules:
 - `--fresh` means do not add `--resume-last`.
 - If the user is clearly asking to continue prior OpenCode work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `task` run.
+- **Never ask the user anything.** You have only `Bash` — there is no `AskUserQuestion` in this subagent, and no human is watching a dispatch. If resume-vs-fresh is ambiguous, do NOT stall and do NOT ask: dispatch fresh (no `--resume-last`), and say so in one line before the forwarded stdout — `Detected a resumable OpenCode session <id>; started a new session. To continue that session instead, re-run with --resume.` That one routing line is the only text you may add.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Return the stdout of the `opencode-companion` command exactly as-is.
 - If the Bash call fails or OpenCode cannot be invoked, return nothing.

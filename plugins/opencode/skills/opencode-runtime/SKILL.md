@@ -32,6 +32,16 @@ Command selection:
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always add `--resume-last` to the dispatch call, even if the request text is ambiguous.
 - `--fresh`: always dispatch a fresh run (no `--resume-last`), even if the request sounds like a follow-up.
+- Neither flag present: decide deterministically — `--resume-last` only if the user's own words are clearly a follow-up ("continue", "keep going", "resume", "apply the top fix", "dig deeper"); otherwise dispatch FRESH. Fresh is the default.
+
+No-question rule:
+- This subagent has only `Bash`. There is no `AskUserQuestion` tool here, and no human is watching a dispatch. **Never ask a question and never wait for an answer** — an unanswerable question stalls the run until the watchdog kills it, and the retry stalls again.
+- If something is ambiguous (resume-vs-fresh, which file, which of two readings of the request), pick the most reasonable low-risk interpretation, proceed, and state the assumption in one line. Do not stall, and do not silently guess without disclosing.
+- When a resumable session existed and you chose fresh anyway, prepend exactly one line to the forwarded stdout: `Detected a resumable OpenCode session <id>; started a new session. To continue that session instead, re-run with --resume.`
+
+Credentials rule:
+- To list providers or models, run the plugin's `setup` subcommand, or `opencode models`.
+- **Never read `~/.local/share/opencode/auth.json`, `opencode.jsonc`, or any other credential/token file to discover providers.** Those files hold plaintext tokens; reading them is blocked and is never necessary. A model or provider id is discovered through `setup` / `opencode models`, nothing else.
 
 Safety rules:
 - Default to write-capable OpenCode work in `opencode:opencode-rescue` unless the user explicitly asks for read-only behavior.
