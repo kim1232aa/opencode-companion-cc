@@ -51,15 +51,15 @@ async function resolveModelAvailable(client, model) {
   const refs = await client.listModelRefs().catch(() => null);
   if (!refs || !refs.size || refs.has(model)) return model;
   // Unambiguous dropped-provider-prefix ref ⇒ auto-fix (the token line then
-  // shows what actually ran). OpenCode's UI shows the provider NAME (e.g.
-  // "freeapi"), not the ID (e.g. "volcano-coding"), so this is a common slip.
+  // shows what actually ran). OpenCode's UI can show a provider display NAME
+  // that differs from the ID a ref needs, so dropping the prefix is a common slip.
   const exact = suggestModelRefs(refs, model, 50).filter((r) => r.endsWith(`/${model}`));
   if (exact.length === 1) return exact[0];
   const sugg = suggestModelRefs(refs, model);
   throw new Error(
     `Model "${model}" is not available on the OpenCode server.` +
     (sugg.length ? ` Did you mean: ${sugg.join("  |  ")} ?` : "") +
-    ` A ref is <providerID>/<modelID>; the provider ID (e.g. volcano-coding) is NOT the name shown in OpenCode's UI (e.g. freeapi). Run \`/opencode:setup\` to list provider IDs.`
+    ` A ref is <providerID>/<modelID>; the providerID is the id from your opencode config (not necessarily the display name OpenCode's UI shows), and the modelID may itself contain slashes. Run \`/opencode:setup\` to list the exact provider IDs.`
   );
 }
 

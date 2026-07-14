@@ -48,8 +48,8 @@ generic prompt advice.
 ## Model selection
 
 - `--model` must be `provider/model`, split on the FIRST slash — model ids may
-  themselves contain slashes (e.g. `volcano-coding/火山方舟Coding_Plan/glm-5.2`
-  is provider `volcano-coding`, model `火山方舟Coding_Plan/glm-5.2`).
+  themselves contain slashes (e.g. `myprovider/group/model-name` is provider
+  `myprovider`, model `group/model-name`).
 - Omit `--model` to use the provider default. Only pass one the user asked for;
   a bad ref fails the dispatch with "--model must be in the form
   provider/model".
