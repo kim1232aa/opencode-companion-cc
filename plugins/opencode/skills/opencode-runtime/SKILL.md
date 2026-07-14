@@ -6,46 +6,51 @@ user-invocable: false
 
 # OpenCode Runtime
 
-Use this skill only inside the `opencode:opencode-rescue` subagent.
+Helper: `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" <subcommand> …`
+(`--help` lists every subcommand and flag). Prefer it over hand-rolled `git` or raw
+OpenCode CLI strings.
 
-Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" task "<raw arguments>"`
+## Delegate from the main loop — a subagent costs ~50x more
 
-Execution rules:
-- The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
-- Prefer the helper over hand-rolled `git`, direct OpenCode CLI strings, or any other Bash activity.
-- Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel` from `opencode:opencode-rescue`.
-- Default to `wait-and-result` for every rescue request (diagnosis, planning, research, and explicit fix requests). It dispatches on a tracked worker, BLOCKS until the task finishes, and prints the actual result — so you return real output, not just a job id. Use `task --background` ONLY when the user explicitly asked for fire-and-forget background execution.
-- Forward the user's task text byte-for-byte. Never summarize, shorten, paraphrase, or "tighten" it, no matter how long or detailed it is — length is not a reason to compress it.
-- Do not inspect the repo, solve the task yourself, or add independent analysis. Your only Claude-side work is stripping routing flags before the single dispatch call.
-- Leave `--agent` unset (defaults to build, write-capable) unless the user explicitly requests a specific agent. Add `--agent plan` ONLY when the user explicitly asks for read-only behavior ("don't change anything", "review only", "no edits") — that is the only thing that makes the run read-only. Do NOT infer read-only from investigative-sounding words ("diagnose", "research", "look into"); such requests often precede a fix.
-- Leave model unset by default. Add `--model` only when the user explicitly asks for one.
+| How | Claude tokens | When |
+| --- | --- | --- |
+| main loop → `task --background "<task>"`, later `result <id>` | **≈200** | **Default.** Job id returns instantly; the main loop never blocks. |
+| main loop → N × `task --background` in one turn (or `batch`, if present — see `--help`) | ≈200 × N | Parallel fan-out. |
+| main loop → `wait-and-result "<task>"` (foreground Bash, `timeout: 600000`) | ≈200 + result | You want the answer in this turn. |
+| `Task(opencode:opencode-rescue)` subagent | **≈10,000 fixed** | Only when the delegation needs multi-step reasoning (probe → decide → re-dispatch), or a very long result must be summarized before entering the main context. |
 
-Command selection:
-- Use exactly one dispatch invocation per rescue handoff: `wait-and-result` by default, or `task --background` when the user explicitly asked for background.
-- Run `wait-and-result` as a FOREGROUND, blocking `Bash` call with `timeout: 600000` — that is the Bash tool's MAXIMUM (10 minutes); you cannot set more. The companion itself waits up to 35 minutes internally (`--timeout-ms` / `OPENCODE_COMPANION_WAIT_TIMEOUT_MS` override), so a task longer than 10 minutes WILL have its Bash call cut off — that is expected, not a failure. The recovery flow is designed for it: take the job id from the `[opencode] job <id> dispatched…` line on stderr, then poll with further `Bash` calls to `result <id>` (or `status`) until the result is ready, and return it. NEVER use run_in_background for the dispatch, and NEVER answer with "I'll wait" / "I'll check the result later" — always either return the blocking call's stdout or actively fetch via `result <id>`.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only — it selects the subcommand (`task --background` vs `wait-and-result`). Strip the token before dispatching, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, pass it through to the dispatch call.
-- If the forwarded request includes `--agent`, pass it through to the dispatch call.
-- If the forwarded request includes `--worktree`, pass it through to the dispatch call. It isolates a write-capable run in a throwaway git worktree so OpenCode's snapshots can't revert unrelated concurrent edits; the companion applies the result back afterward. Both `wait-and-result` and `task` accept it.
-- If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
-- If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
-- `--resume`: always add `--resume-last` to the dispatch call, even if the request text is ambiguous.
-- `--fresh`: always dispatch a fresh run (no `--resume-last`), even if the request sounds like a follow-up.
-- Neither flag present: decide deterministically — `--resume-last` only if the user's own words are clearly a follow-up ("continue", "keep going", "resume", "apply the top fix", "dig deeper"); otherwise dispatch FRESH. Fresh is the default.
+The ~10k is paid before any useful work happens. Four rescue subagents that each wrap
+one Bash call burn ~40k and buy nothing over four Bash calls.
 
-No-question rule:
-- This subagent has only `Bash`. There is no `AskUserQuestion` tool here, and no human is watching a dispatch. **Never ask a question and never wait for an answer** — an unanswerable question stalls the run until the watchdog kills it, and the retry stalls again.
-- If something is ambiguous (resume-vs-fresh, which file, which of two readings of the request), pick the most reasonable low-risk interpretation, proceed, and state the assumption in one line. Do not stall, and do not silently guess without disclosing.
-- When a resumable session existed and you chose fresh anyway, prepend exactly one line to the forwarded stdout: `Detected a resumable OpenCode session <id>; started a new session. To continue that session instead, re-run with --resume.`
+## Dispatch contract (inside the rescue subagent)
 
-Credentials rule:
-- To list providers or models, run the plugin's `setup` subcommand, or `opencode models`.
-- **Never read `~/.local/share/opencode/auth.json`, `opencode.jsonc`, or any other credential/token file to discover providers.** Those files hold plaintext tokens; reading them is blocked and is never necessary. A model or provider id is discovered through `setup` / `opencode models`, nothing else.
+Forwarder, not orchestrator: **one** dispatch call, stdout returned unchanged, no repo
+inspection, no follow-up work, never `setup`/`review`/`adversarial-review`/`cancel`.
 
-Safety rules:
-- Default to write-capable OpenCode work in `opencode:opencode-rescue` unless the user explicitly asks for read-only behavior.
-- Preserve the user's task text as-is apart from stripping routing flags.
-- Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
-- Return the stdout of the dispatch command exactly as-is (including the trailing token-usage line the companion appends).
-- If the Bash call fails or OpenCode cannot be invoked, return nothing.
+- **Subcommand:** `wait-and-result` by default (blocks, prints the real result);
+  `task --background` only if fire-and-forget was explicitly requested.
+- **Foreground `Bash`, `timeout: 600000`** (the maximum). Never `run_in_background`;
+  never reply "I'll check back later". A cut-off call on a long task is expected and
+  recoverable — poll `result <id>` with the job id from the stderr dispatch line.
+- **Task text byte-for-byte.** No summarizing, shortening, or paraphrasing.
+- **Flags are routing controls, never task text**: `--model`, `--agent`, `--worktree`,
+  `--background`/`--wait`, `--resume`/`--fresh`. Strip them from the text; map them
+  onto the dispatch call.
+- **Resume vs fresh is deterministic:** `--resume` → `--resume-last`; `--fresh` → not.
+  Neither → resume only if the user's own words are clearly a follow-up ("continue",
+  "keep going", "apply the top fix", "dig deeper"); **otherwise fresh. Fresh is the
+  default.**
+- **Write-capable by default.** `--agent plan` is the ONLY read-only mode and needs an
+  explicit "don't change anything" / "review only" — investigative wording is not
+  enough. Leave `--model` unset unless the user named one.
+- **Never ask a question.** No `AskUserQuestion` here, no human watching: an
+  unanswerable question stalls until the watchdog kills the run, and the retry stalls
+  again. Ambiguity → take the low-risk reading, proceed, disclose in one line. Chose
+  fresh over an existing resumable session? Prepend exactly:
+  `Detected a resumable OpenCode session <id>; started a new session. To continue that session instead, re-run with --resume.`
+- **Never read credential files.** List providers/models with `opencode models` or the
+  `setup` subcommand — never `~/.local/share/opencode/auth.json`, `opencode.jsonc`, or
+  any other token file (plaintext tokens; blocked; never necessary).
+
+Full flag semantics, the cut-off/recovery flow, worktree isolation, and failure rules:
+[references/dispatch-contract.md](references/dispatch-contract.md).

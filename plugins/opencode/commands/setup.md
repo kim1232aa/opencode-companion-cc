@@ -1,10 +1,29 @@
 ---
-description: Check whether the local OpenCode CLI is ready and optionally toggle the stop-time review gate
-argument-hint: '[--enable-review-gate|--disable-review-gate]'
+description: Check whether the local OpenCode CLI is ready, toggle the stop-time review gate, or install the `occ` CLI launcher
+argument-hint: '[--enable-review-gate|--disable-review-gate] [--install-cli|--uninstall-cli] [--cli-name <name>]'
 allowed-tools: Bash(node:*), Bash(npm:*), Bash(brew:*), Bash(curl:*), AskUserQuestion
 ---
 
-Run:
+CLI launcher rule (check this FIRST):
+- If `$ARGUMENTS` contains `--install-cli` or `--uninstall-cli`, run the command
+  WITHOUT `--json` and present its output verbatim. It is a local filesystem
+  operation: it does not need OpenCode installed or the server running, so skip
+  every installation check below.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" setup $ARGUMENTS
+```
+
+- `--install-cli` writes a short launcher (default `occ`) into `~/.local/bin`, so the
+  user can run `occ status` / `occ watch` / `occ result <id>` from any terminal
+  instead of a 90-character `node .../<version>/scripts/opencode-companion.mjs`.
+  The launcher resolves the newest installed version at run time, so a plugin
+  upgrade never breaks it.
+- If it reports a name collision, tell the user to retry with `--cli-name <name>`.
+- If it reports that `~/.local/bin` is not on PATH, surface the exact one-line
+  command it printed — it is copy-pasteable as-is.
+
+Otherwise, run:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" setup --json $ARGUMENTS

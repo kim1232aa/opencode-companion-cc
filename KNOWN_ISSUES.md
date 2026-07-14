@@ -45,6 +45,12 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
   reconciles to `failed`. Low-probability (tiny window) and self-correcting on
   the next successful probe.
 
+- **A few older tests are not state-isolated.** `job-heal`, `job-control` and
+  `status-dashboard` read the real job store instead of a temp
+  `OPENCODE_COMPANION_DATA`, so they can flake if a real delegation happens to
+  be writing state while the suite runs. Re-running is green; the fix is to give
+  them the same temp-dir isolation the newer tests use.
+
 ## Platform / scope
 
 - **Windows is not actively supported.** `resolveOpencodeBinary` uses `which`

@@ -23,15 +23,39 @@ export function matchOption(token) {
 
 /**
  * Parse CLI arguments into options and positional args.
+ *
+ * TWO CLASSES OF SUBCOMMAND, ON PURPOSE — do not "unify" them:
+ *
+ *   1. RETRIEVAL commands (status / result / cancel / setup / watch) carry NO
+ *      task text. Every token on their command line is meant to be an option,
+ *      so an unknown `--flag` can only ever be a TYPO. They pass `strict: true`
+ *      and the caller fails fast on `unknown` (see formatUnknownOptionError).
+ *      The bug this fixes: `status --watc` used to print `warning: unknown
+ *      option --watc`, set it to `true`, and then quietly run as a plain
+ *      one-shot `status` — so the live panel "didn't work" and nothing said why.
+ *
+ *   2. DISPATCH commands (task / wait-and-result / batch) carry FREE-FORM TASK
+ *      TEXT, which may legitimately contain option-shaped tokens ("run git
+ *      commit --no-verify"). Those must be forwarded VERBATIM, so an unknown
+ *      `--flag` is demoted to task text and is never an error. They do not use
+ *      strict mode at all — they use parseTaskArgv (below), which is where that
+ *      promise is implemented. Making them strict would re-break byte-for-byte
+ *      forwarding, a bug that was already found and fixed once.
+ *
+ * Non-strict mode keeps the historical lenient behavior (warn + set true) for
+ * the internal callers (task-worker, review) that still rely on it.
+ *
  * @param {string[]} argv
- * @param {{ valueOptions?: string[], booleanOptions?: string[] }} schema
- * @returns {{ options: Record<string, string|boolean>, positional: string[] }}
+ * @param {{ valueOptions?: string[], booleanOptions?: string[], strict?: boolean }} schema
+ * @returns {{ options: Record<string, string|boolean>, positional: string[], unknown: string[] }}
  */
 export function parseArgs(argv, schema = {}) {
   const valueSet = new Set(schema.valueOptions ?? []);
   const boolSet = new Set(schema.booleanOptions ?? []);
+  const strict = schema.strict === true;
   const options = {};
   const positional = [];
+  const unknown = [];
 
   let endOfOptions = false;
   for (let i = 0; i < argv.length; i++) {
@@ -73,13 +97,112 @@ export function parseArgs(argv, schema = {}) {
       }
     } else if (boolSet.has(key)) {
       options[key] = true;
+    } else if (strict) {
+      // Collect, don't decide: the CALLER owns the error message and the exit
+      // code, so this stays a pure parser and stays unit-testable.
+      unknown.push(key);
     } else {
       process.stderr.write(`warning: unknown option --${key}\n`);
       options[key] = true;
     }
   }
 
-  return { options, positional };
+  return { options, positional, unknown };
+}
+
+/**
+ * Levenshtein distance, capped at `max` (we only ever care about near-misses,
+ * so an early bail-out keeps this O(n·m) on tiny strings and nothing more).
+ * @param {string} a
+ * @param {string} b
+ * @param {number} [max]
+ * @returns {number}
+ */
+function editDistance(a, b, max = Infinity) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > max) return max + 1; // whole row already too far — give up
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/**
+ * Pick the closest legal option to what the user actually typed.
+ *
+ * A PREFIX of a real option ("--watc" for "--watch", "--inter" for "--interval")
+ * is the overwhelmingly common slip, so it is scored ahead of a same-distance
+ * unrelated option. Everything else falls back to edit distance with a tolerance
+ * that scales with the word's length — so "--jsn"→"--json" is suggested, while
+ * a genuinely different flag is not.
+ *
+ * @param {string} input - the unknown option key (no leading dashes)
+ * @param {string[]} candidates - the legal option keys for THAT subcommand
+ * @returns {string|null}
+ */
+export function didYouMean(input, candidates = []) {
+  const word = String(input ?? "").toLowerCase();
+  if (!word || !candidates.length) return null;
+
+  const tolerance = Math.max(2, Math.floor(word.length / 3));
+  let best = null;
+  let bestScore = Infinity;
+
+  for (const c of candidates) {
+    const cand = String(c).toLowerCase();
+    const dist = editDistance(word, cand, tolerance);
+    // A prefix match is the likeliest typo (a dropped or truncated tail), so it
+    // gets a fractional bonus that only ever breaks ties in its favor.
+    const isPrefix = cand.startsWith(word) || word.startsWith(cand);
+    const score = dist - (isPrefix ? 0.5 : 0);
+    if (dist <= tolerance && score < bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+
+  return best;
+}
+
+/**
+ * The fail-fast message for an unknown option on a no-task-text subcommand.
+ * Pure (returns the text; the caller prints and exits), so it is testable
+ * without spawning a process.
+ *
+ * @param {string} subcommand
+ * @param {string[]} unknownKeys
+ * @param {string[]} knownOptions - the legal option keys for that subcommand
+ * @param {{ cli?: string }} [opts]
+ * @returns {string}
+ */
+export function formatUnknownOptionError(subcommand, unknownKeys = [], knownOptions = [], opts = {}) {
+  const cli = opts.cli ?? "opencode-companion";
+  const lines = [];
+
+  for (const key of unknownKeys) {
+    lines.push(`Error: unknown option \`--${key}\` for \`${subcommand}\`.`);
+    const hit = didYouMean(key, knownOptions);
+    if (hit) {
+      lines.push(`  Did you mean \`--${hit}\`?`);
+    } else if (!knownOptions.length) {
+      lines.push(`  \`${subcommand}\` takes no options (only an optional job id).`);
+    } else {
+      lines.push(`  Valid options for \`${subcommand}\`: ${knownOptions.map((o) => `--${o}`).join(", ")}`);
+    }
+  }
+
+  lines.push(`Run \`${cli} --help\` for the full list of options.`);
+  return lines.join("\n");
 }
 
 /**

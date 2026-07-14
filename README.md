@@ -131,13 +131,82 @@ Additional hardening (background-job self-heal, recursive-delegation guard,
 error classification, and expanded test coverage) is consolidated from the
 suharvest and JohnnyVicious forks — see the [NOTICE](NOTICE) file for attribution.
 
+## Delegation Cost — dispatch from the main loop, not from a subagent
+
+Delegating is a **Bash call**, not a reasoning task. Route it accordingly:
+
+| How you delegate | Claude tokens | Use it when |
+| --- | --- | --- |
+| Main loop → `task --background "<task>"`, later `result <id>` | **≈200** | **Default.** Returns a job id instantly; the main loop never blocks. |
+| Main loop → N × `task --background` in one turn | ≈200 × N | Parallel fan-out of independent tasks. |
+| Main loop → `wait-and-result "<task>"` (foreground Bash) | ≈200 + result | You want the answer in this turn. |
+| `Task(opencode:opencode-rescue)` subagent | **≈10,000 fixed** | Only when the delegation itself needs multi-step reasoning (probe → decide → re-dispatch), or a very long result must be summarized before it enters the main context. |
+
+The subagent's ~10k is paid **before any useful work happens** — it is the agent
+definition, its skills, and the subagent's own turns; the real work runs on
+OpenCode and costs OpenCode tokens either way. Four parallel rescue subagents that
+each wrap a single `Bash` call burn **~40k Claude tokens** and buy nothing over
+four `Bash` calls. The wrapper only pays for itself when it absorbs more context
+than it costs.
+
+`opencode-companion.mjs --help` lists every subcommand and flag.
+
 ## Slash Commands
 
-- `/opencode:rescue` — delegate a task via the `opencode:opencode-rescue` subagent. Blocks and returns the real result by default; `--background` is fire-and-forget. `--model <provider/model>`, `--agent <build|plan>`, `--resume`, `--fresh`, `--background`, `--worktree`.
+- `/opencode:rescue` — delegate a task to OpenCode. Dispatches directly from the main loop (no subagent). Blocks and returns the real result by default; `--background` is fire-and-forget. `--model <provider/model>`, `--agent <build|plan>`, `--resume`, `--fresh`, `--background`, `--worktree`.
 - `/opencode:review` — read-only OpenCode review. `--base <ref>`, `--model <id>`, `--wait`, `--background`.
 - `/opencode:adversarial-review` — steerable challenge review; accepts custom focus text. `--model <id>`.
 - `/opencode:status` / `/opencode:result` / `/opencode:cancel` — manage background jobs.
-- `/opencode:setup` — check OpenCode install/auth; enable/disable the review-gate hook.
+- `/opencode:setup` — check OpenCode install/auth; enable/disable the review-gate hook; install the `occ` CLI launcher.
+
+## The `occ` CLI — watch delegations from a terminal, for zero Claude tokens
+
+The companion is a plain Node CLI, so you can drive it from a terminal instead of
+from Claude. Install a short launcher once:
+
+```bash
+/opencode:setup --install-cli          # writes ~/.local/bin/occ
+```
+
+It refuses to shadow an existing command (`occ`, not `oc` — that one is the
+OpenShift CLI); pass `--cli-name <name>` if you want another name, and
+`--uninstall-cli` to remove it. The launcher **resolves the newest installed
+plugin version at run time**, so upgrading the plugin never breaks it — no version
+is baked in.
+
+```bash
+occ watch                   # LIVE panel of every delegation, in EVERY repo
+occ watch --workspace ~/code/api   # …or just one, without cd-ing there
+occ status                  # this repo's jobs, once
+occ result <job id>
+```
+
+`occ watch` is the cross-repo view: job state is stored per workspace, so
+`status --watch` only ever sees the repo you are standing in — a delegation
+dispatched from another repo simply never showed up. `watch` aggregates them all
+and tags each row with the repo it belongs to:
+
+```
+OpenCode delegations · live — refreshed 05:06:50, every 3s · Ctrl-C to exit
+2 running · all workspaces · 4 repos
+────────────────────────────────────────────────────────────────────────
+## Running Jobs (2)
+
+- 🟢 [api] **task-mrkz-c3d4** (task) · editing · 4m 12s · 6,001 OpenCode tokens
+- 🟢 [opencode-companion-cc] **task-mrky-a1b2** (task) · investigating · 2m 3s · 14,203 OpenCode tokens
+  ↳ bash: npm test
+
+## ❌ Failed (1)
+
+- ❌ [MiroFish] **task-mrkb-g7h8** (task) — failed — 1m 30s
+  Error: worker (pid 4242) exited without completing
+```
+
+It reads local job state only — no server probe, no writes — so it never disturbs
+the jobs it is showing you, and it costs **zero Claude tokens**.
+
+Every token number it prints is OPENCODE-side usage: the work you delegated. It
+is not billed to your Claude context or quota.
 
 ## Review Gate
 

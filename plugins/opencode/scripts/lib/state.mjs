@@ -3,6 +3,7 @@
 // JSON state file, per-job files and logs.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,31 +39,100 @@ function deriveOwnDataDir() {
 }
 
 /**
- * Compute the state directory root for a workspace. Data-dir priority:
+ * The directory that holds EVERY workspace's state dir (one hashed subdir each).
+ * Data-dir priority:
  *   1. OPENCODE_COMPANION_DATA (explicit opt-in override)
  *   2. our own install-derived data dir
  *   3. CLAUDE_PLUGIN_DATA — ONLY if it actually names an opencode dir (guards
  *      against inheriting another plugin's exported value)
  *   4. os.tmpdir()/opencode-companion  (fixes the old hardcoded "/tmp")
+ * @returns {string}
+ */
+export function stateBase() {
+  const override = process.env.OPENCODE_COMPANION_DATA;
+  const own = deriveOwnDataDir();
+  const envData = process.env.CLAUDE_PLUGIN_DATA;
+  if (override) return path.join(override, "state");
+  if (own) return path.join(own, "state");
+  if (envData && /opencode/i.test(path.basename(envData))) return path.join(envData, "state");
+  return path.join(os.tmpdir(), "opencode-companion");
+}
+
+/**
+ * Compute the state directory root for a workspace: <base>/<sha256(path)>.
  * @param {string} workspacePath
  * @returns {string}
  */
 export function stateRoot(workspacePath) {
-  let base;
-  const override = process.env.OPENCODE_COMPANION_DATA;
-  const own = deriveOwnDataDir();
-  const envData = process.env.CLAUDE_PLUGIN_DATA;
-  if (override) {
-    base = path.join(override, "state");
-  } else if (own) {
-    base = path.join(own, "state");
-  } else if (envData && /opencode/i.test(path.basename(envData))) {
-    base = path.join(envData, "state");
-  } else {
-    base = path.join(os.tmpdir(), "opencode-companion");
-  }
   const hash = crypto.createHash("sha256").update(workspacePath).digest("hex").slice(0, 16);
-  return path.join(base, hash);
+  return path.join(stateBase(), hash);
+}
+
+/**
+ * Remember WHICH workspace a hashed state dir belongs to.
+ *
+ * The dir name is a one-way sha256 of the workspace path, so a cross-workspace
+ * reader (`watch`, which aggregates every repo's jobs) could otherwise only ever
+ * label a job with a meaningless hash. A tiny sidecar next to state.json is the
+ * whole index — state.json's own {config, jobs} contract stays untouched, and a
+ * corrupt/missing sidecar just degrades the LABEL, never the jobs.
+ *
+ * Best-effort and idempotent: it rewrites only when the path actually changed.
+ * @param {string} root
+ * @param {string} workspacePath
+ */
+function stampWorkspace(root, workspacePath) {
+  if (!workspacePath) return;
+  const file = path.join(root, "workspace.json");
+  try {
+    if (readJson(file)?.workspace === workspacePath) return;
+    writeJson(file, { workspace: workspacePath });
+  } catch {
+    // A label is a nicety; never fail a state write over it.
+  }
+}
+
+/**
+ * Every workspace this data dir knows about, with its jobs.
+ *
+ * Read-only and crash-proof BY DESIGN: this backs the live `watch` panel, which
+ * must never mutate the state it is observing (a background delegation is
+ * writing to these same files while we read) and must never die because ONE
+ * repo's state.json is half-written or corrupt — that repo is skipped, the rest
+ * of the board still paints.
+ *
+ * @param {{ base?: string }} [opts]
+ * @returns {{ hash: string, workspace: string|null, jobs: object[], corrupt: boolean }[]}
+ */
+export function listWorkspaceStates(opts = {}) {
+  const base = opts.base ?? stateBase();
+
+  let entries;
+  try {
+    entries = fs.readdirSync(base, { withFileTypes: true });
+  } catch {
+    return []; // no data dir yet ⇒ no workspaces, not an error
+  }
+
+  const out = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const root = path.join(base, entry.name);
+
+    // readJson swallows both "missing" and "unparseable" into null, which is
+    // exactly the semantics we want: a torn write is a skipped repo, not a crash.
+    const state = readJson(path.join(root, "state.json"));
+    const jobs = Array.isArray(state?.jobs) ? state.jobs : [];
+    const workspace = readJson(path.join(root, "workspace.json"))?.workspace ?? null;
+
+    out.push({
+      hash: entry.name,
+      workspace: typeof workspace === "string" ? workspace : null,
+      jobs,
+      corrupt: state === null,
+    });
+  }
+  return out;
 }
 
 /**
@@ -93,6 +163,7 @@ export function loadState(workspacePath) {
 export function saveState(workspacePath, state) {
   const root = stateRoot(workspacePath);
   writeJson(stateFile(root), state);
+  stampWorkspace(root, workspacePath);
 }
 
 /**
