@@ -1,6 +1,6 @@
 ---
 description: Run a steerable adversarial OpenCode review that challenges implementation and design decisions
-argument-hint: '[--wait|--background] [--base <ref>] [focus area or custom review instructions]'
+argument-hint: '[--wait|--background] [--base <ref>] [--brief|--full] [--max-words <n>] [focus area or custom review instructions]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -39,7 +39,10 @@ Argument handling:
 
 Building the command safely (IMPORTANT — do not paste `$ARGUMENTS` raw into a shell string):
 - Split the raw arguments into the recognized FLAGS (`--wait`, `--background`,
-  `--base <ref>`, `--model <ref>`) and the remaining FOCUS text.
+  `--base <ref>`, `--model <ref>`, and the output-budget flags `--brief` /
+  `--full` / `--max-words <n>`) and the remaining FOCUS text. The focus may also
+  be given with `--task` / `--prompt` / `--task-file <path>` (same sources and
+  precedence as `/opencode:task`); a bare positional is the usual form.
 - Pass each flag through unchanged, and pass the focus as ONE argument, quoted so
   that any shell metacharacters in it (`"`, `` ` ``, `$`, `;`, `&`, `|`,
   newlines) are taken literally and never interpreted or split. Single-quote it

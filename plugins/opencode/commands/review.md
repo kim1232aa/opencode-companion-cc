@@ -1,6 +1,6 @@
 ---
 description: Run an OpenCode code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--model <provider/model>]'
+argument-hint: '[--wait|--background] [--base <ref>] [--model <provider/model>] [--brief|--full] [--max-words <n>]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -41,10 +41,12 @@ Argument handling:
 
 Building the command safely (do not paste `$ARGUMENTS` raw into a shell string):
 - This command takes only the recognized flags `--wait`, `--background`,
-  `--base <ref>`, `--model <ref>`. Pass each through unchanged, and quote any flag
-  VALUE that contains a shell metacharacter (`"`, `` ` ``, `$`, `;`, `&`, `|`,
-  spaces) so it is taken literally — never inline an unquoted value into the
-  command string.
+  `--base <ref>`, `--model <ref>`, and the output-budget flags `--brief` /
+  `--full` (aliased `--no-brief`) / `--max-words <n>` (tightens the PROSE inside
+  the review's JSON fields; the output schema itself is untouched, and the budget
+  stays opt-in). Pass each through unchanged, and quote any flag VALUE that
+  contains a shell metacharacter (`"`, `` ` ``, `$`, `;`, `&`, `|`, spaces) so it
+  is taken literally — never inline an unquoted value into the command string.
 
 Foreground flow:
 - Run (values quoted as above), e.g.:

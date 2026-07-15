@@ -373,6 +373,28 @@ function resolveTaskText(options, positionalText) {
 }
 
 /**
+ * Resolve an adversarial-review FOCUS from the same sources `task` accepts
+ * (--task/--prompt/--task-file/positional), reusing resolveTaskText's precedence
+ * so `--task "X"` yields the clean focus "X" instead of leaking the literal
+ * "--task" token into it. An empty focus is valid ("general review"), so when no
+ * source is present the stdin fallback is skipped and "" is returned — a review
+ * launched with an unrelated stdin pipe must never slurp it as the focus.
+ * @param {Record<string, string|boolean>} options
+ * @param {string} positionalText
+ * @returns {{ focus: string, errors: string[] }}
+ */
+export function resolveReviewFocus(options, positionalText) {
+  const hasSource =
+    (typeof options.task === "string" && options.task.trim() !== "") ||
+    (typeof options.prompt === "string" && options.prompt.trim() !== "") ||
+    options["task-file"] !== undefined ||
+    positionalText.trim() !== "";
+  if (!hasSource) return { focus: "", errors: [] };
+  const resolved = resolveTaskText(options, positionalText);
+  return { focus: resolved.taskText.trim(), errors: resolved.errors };
+}
+
+/**
  * Fail fast on an invocation that has no usable task — BEFORE a job record
  * exists or a worker is spawned. The old code only warned and ran anyway, which
  * burned a whole delegation on an empty task and then reported it, minutes
@@ -577,9 +599,13 @@ function handleCliInstall(options) {
 
 async function handleReview(argv) {
   const { options } = parseArgs(argv, {
-    valueOptions: ["base", "model"],
-    booleanOptions: ["wait", "background"],
+    valueOptions: ["base", "model", "max-words"],
+    booleanOptions: ["wait", "background", "brief", "no-brief", "full"],
   });
+  // Reviews keep the budget OPT-IN (the JSON schema already bounds them), so an
+  // unspecified brief passes through as undefined and adds nothing. Matches the
+  // Codex frontend's oc_review, which already exposes brief/maxWords.
+  const budget = resolveOutputBudget(options);
 
   const workspace = await resolveWorkspace();
   const job = createJobRecord(workspace, "review", { base: options.base, model: options.model });
@@ -594,6 +620,8 @@ async function handleReview(argv) {
       const prompt = await buildReviewPrompt(workspace, {
         base: options.base,
         adversarial: false,
+        brief: budget.brief,
+        maxWords: budget.maxWords,
       }, PLUGIN_ROOT);
 
       report("reviewing", "Running review...");
@@ -643,20 +671,28 @@ async function handleAdversarialReview(argv) {
   // inside it ("review the --verbose path") must survive. parseTaskArgv keeps it
   // as text (like a task); the plain parseArgs would drop it as an unknown option.
   const { options, taskText, errors } = parseTaskArgv(argv, {
-    valueOptions: ["base", "model"],
-    booleanOptions: ["wait", "background"],
+    valueOptions: ["base", "model", "task", "prompt", "task-file", "max-words"],
+    booleanOptions: ["wait", "background", "brief", "no-brief", "full"],
   });
-  if (errors.length) {
-    console.error(`Invalid arguments for \`adversarial-review\`:\n  - ${errors.join("\n  - ")}`);
+  // Fold --task/--prompt/--task-file/positional into ONE focus (see
+  // resolveReviewFocus) so a caller reaching for --task gets a clean focus
+  // instead of the literal "--task" leaking into it.
+  const { focus, errors: focusErrors } = resolveReviewFocus(options, taskText);
+  const allErrors = [...errors, ...focusErrors];
+  if (allErrors.length) {
+    console.error(`Invalid arguments for \`adversarial-review\`:\n  - ${allErrors.join("\n  - ")}`);
     process.exit(1);
   }
 
-  const focus = taskText.trim();
+  const budget = resolveOutputBudget(options);
   const workspace = await resolveWorkspace();
   const job = createJobRecord(workspace, "adversarial-review", {
     base: options.base,
     focus,
     model: options.model,
+    // Surface the focus in `status`/`watch` (taskPreview reads taskText). Inert
+    // for dispatch: the review builds its own prompt from `focus`, not taskText.
+    ...(focus ? { taskText: focus } : {}),
   });
 
   // Foreground blocking: `x`/Ctrl-C must abort the OpenCode session it drives.
@@ -670,6 +706,8 @@ async function handleAdversarialReview(argv) {
         base: options.base,
         adversarial: true,
         focus,
+        brief: budget.brief,
+        maxWords: budget.maxWords,
       }, PLUGIN_ROOT);
 
       report("reviewing", "Running adversarial review...");
