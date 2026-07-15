@@ -10,7 +10,7 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, parseTaskArgv, classifyWaitTarget, matchOption, formatUnknownOptionError } from "./lib/args.mjs";
-import { isOpencodeInstalled, getOpencodeVersion, spawnDetached } from "./lib/process.mjs";
+import { isOpencodeInstalled, getOpencodeVersion, spawnDetached, terminateGroup } from "./lib/process.mjs";
 import { isServerRunning, createClient, connect, ensureServer, suggestModelRefs, dispatchWithRetry } from "./lib/opencode-server.mjs";
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, jobDataPath, jobLogPath, listWorkspaceStates, stateRoot } from "./lib/state.mjs";
@@ -584,6 +584,8 @@ async function handleReview(argv) {
   const workspace = await resolveWorkspace();
   const job = createJobRecord(workspace, "review", { base: options.base, model: options.model });
 
+  // Foreground blocking: `x`/Ctrl-C must abort the OpenCode session it drives.
+  const uninstall = installForegroundCancelHandler(workspace, () => [job.id]);
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
       report("starting", "Connecting to OpenCode server...");
@@ -631,6 +633,8 @@ async function handleReview(argv) {
   } catch (err) {
     console.error(`Review failed: ${err.message}`);
     process.exit(1);
+  } finally {
+    uninstall();
   }
 }
 
@@ -648,6 +652,8 @@ async function handleAdversarialReview(argv) {
     model: options.model,
   });
 
+  // Foreground blocking: `x`/Ctrl-C must abort the OpenCode session it drives.
+  const uninstall = installForegroundCancelHandler(workspace, () => [job.id]);
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
       report("starting", "Connecting to OpenCode server...");
@@ -693,6 +699,8 @@ async function handleAdversarialReview(argv) {
   } catch (err) {
     console.error(`Adversarial review failed: ${err.message}`);
     process.exit(1);
+  } finally {
+    uninstall();
   }
 }
 
@@ -769,7 +777,12 @@ async function handleTask(argv) {
     return;
   }
 
-  // Foreground mode
+  // Foreground mode. This job runs IN THIS process (no detached worker), but the
+  // OpenCode SERVER session it drives lives on independently — so on `x`/Ctrl-C
+  // we must abort that session, or it keeps generating (and billing) after we
+  // die. cancelJobsAndCleanup does exactly that (and, since this job is not a
+  // detachedWorker, correctly does NOT try to signal our own pid).
+  const uninstall = installForegroundCancelHandler(workspace, () => [job.id]);
   try {
     const result = await runTrackedJob(workspace, job, async ({ report, log }) =>
       withWorktree({ dir: workspace, jobId: job.id, useWorktree, isWrite }, async (effectiveCwd) => {
@@ -829,6 +842,8 @@ async function handleTask(argv) {
   } catch (err) {
     console.error(`Task failed: ${err.message}`);
     process.exit(1);
+  } finally {
+    uninstall();
   }
 }
 
@@ -1150,6 +1165,12 @@ export async function handleBatch(argv, deps = {}) {
     "[opencode] blocking until all finish. If this call is cut off, retrieve each with: result <job id>\n"
   );
 
+  // Seam for the CLI to install a foreground cancel handler over the WHOLE batch:
+  // pressing `x` (SIGTERM) must abort every live sub-session and kill every
+  // detached worker, not just the one a single-job handler would know about.
+  // Reported after spawn (so ids/pids exist) and before the blocking wait.
+  deps.onDispatched?.(workspace, dispatched.filter((e) => e.spawned).map((e) => e.jobId));
+
   const entries = await Promise.all(dispatched.map(async (e) => {
     if (!e.spawned) return { ...e, status: "failed" };
     try {
@@ -1190,9 +1211,21 @@ export async function handleBatch(argv, deps = {}) {
 // CLI wrapper: print the summary, and exit non-zero only when EVERY task failed
 // (a partial batch is a success — its results are real).
 async function cliBatch(argv) {
-  const res = await handleBatch(argv);
-  console.log(res.summary);
-  if (res.total > 0 && res.okCount === 0) process.exit(1);
+  // `x` / Ctrl-C during a batch must cascade-cancel ALL of its jobs. handleBatch
+  // reports the dispatched ids (and their workspace) via onDispatched; we arm the
+  // handler then, and disarm it on the normal exit so a clean finish never lingers.
+  let uninstall = () => {};
+  try {
+    const res = await handleBatch(argv, {
+      onDispatched: (workspace, jobIds) => {
+        uninstall = installForegroundCancelHandler(workspace, () => jobIds);
+      },
+    });
+    console.log(res.summary);
+    if (res.total > 0 && res.okCount === 0) process.exit(1);
+  } finally {
+    uninstall();
+  }
 }
 
 // Dispatch a task on a detached worker (so it is tracked, survivable, and
@@ -1291,7 +1324,15 @@ async function handleWaitAndResult(argv) {
   // so the result can be recovered later with `result <id>` instead of lost.
   process.stderr.write(`[opencode] job ${job.id} dispatched; blocking until it finishes. If this call is cut off, retrieve the result later with: result ${job.id}\n`);
 
-  await awaitJobResult(workspace, job.id, timeoutMs);
+  // `x`/Ctrl-C while we block here must take the DETACHED worker and its
+  // OpenCode session down with us — otherwise they keep burning tokens after we
+  // exit. Scope the cascade to the one job THIS call dispatched.
+  const uninstall = installForegroundCancelHandler(workspace, () => [job.id]);
+  try {
+    await awaitJobResult(workspace, job.id, timeoutMs);
+  } finally {
+    uninstall();
+  }
 }
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
@@ -2034,6 +2075,197 @@ async function handleResult(argv) {
   console.log(renderResult(enriched, resultData));
 }
 
+/**
+ * Race a promise against a timeout, so a slow/hung network call can never wedge
+ * a caller that MUST make progress (the `x`/Ctrl-C signal handler above all).
+ * Rejects with a timeout error when the budget elapses; the caller swallows it.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @returns {Promise<T>}
+ */
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Cancel a set of jobs and tear down everything they are still burning. The ONE
+ * shared cleanup path, called by BOTH `handleCancel` (the user runs `cancel`)
+ * and every foreground blocking path's signal handler (the user presses `x` in
+ * Claude Code's shells list, or Ctrl-C). Keeping it single is the point: the
+ * two must never drift into cancelling different things.
+ *
+ * For each job, in order:
+ *   1. CAS the job to "canceled" FIRST (never clobbering an already-terminal
+ *      status). Doing this before the network abort trips the worker's own
+ *      `shouldStop`, so a worker we somehow fail to kill self-aborts instead of
+ *      RETRYING on a fresh session and re-burning tokens — and it means a
+ *      SIGKILL that Claude Code lands mid-cleanup still leaves the job correctly
+ *      marked. A job that legitimately finished during teardown is respected.
+ *   2. ABORT the OpenCode server session (POST /session/:id/abort) — this is
+ *      what actually stops the model generating (the spend). Time-bounded, so a
+ *      hung server can never make `x` hang.
+ *   3. KILL the DETACHED worker's process GROUP (SIGTERM → SIGKILL after a grace
+ *      period). A detached worker has its OWN pgid, so killing the caller's group
+ *      never reached it — we signal `-pid` explicitly via terminateGroup. Only a
+ *      detached worker whose recorded pid is still OURS (start-time verified) is
+ *      ever signalled; a foreground job's pid is the dispatcher itself and a
+ *      recycled pid is a stranger.
+ *
+ * Idempotent + reentrant: a second call (or a duplicate signal) finds the jobs
+ * already terminal and does nothing — no double abort, no double kill.
+ *
+ * @param {string} workspace
+ * @param {string[]} jobIds - the ids to cancel (already resolved/scoped by the caller)
+ * @param {object} [opts]
+ * @param {number} [opts.abortTimeoutMs] - per-session abort budget (default 4000)
+ * @param {number} [opts.killGraceMs] - grace before SIGKILL escalation (default 2000)
+ * @param {object} [opts.client] - injectable server client (tests)
+ * @returns {Promise<{ canceled: string[], alreadyDone: string[] }>}
+ */
+export async function cancelJobsAndCleanup(workspace, jobIds, opts = {}) {
+  const client = opts.client ?? createClient(defaultServerUrl());
+  const abortTimeoutMs = opts.abortTimeoutMs ?? 4000;
+  const killGraceMs = opts.killGraceMs ?? 2000;
+
+  const ids = [...new Set((jobIds ?? []).filter(Boolean))];
+  const canceled = [];
+  const alreadyDone = [];
+  const toTearDown = [];
+
+  // (1) CAS every job to "canceled" first. The CAS reads FRESH state inside the
+  // lock, so pid / pidStart / opencodeSessionId are the values the worker most
+  // recently persisted (it writes its session id in via onSession before the
+  // long sendPrompt) — the snapshot the caller resolved may be staler.
+  for (const jobId of ids) {
+    let finalStatus = null;
+    let didCancel = false;
+    let snapshot = null;
+    updateState(workspace, (state) => {
+      const j = state.jobs?.find((x) => x.id === jobId);
+      if (!j) return;
+      if (j.status !== "running" && j.status !== "pending") {
+        finalStatus = j.status; // already terminal (incl. a prior cancel) — leave it
+        return;
+      }
+      j.status = "canceled";
+      j.completedAt = new Date().toISOString();
+      j.errorMessage = "Canceled by user";
+      j.updatedAt = new Date().toISOString();
+      finalStatus = "canceled";
+      didCancel = true;
+      snapshot = { ...j };
+    });
+    // `didCancel` distinguishes "WE just canceled it" from "it was ALREADY
+    // canceled" — both leave finalStatus === "canceled", but only the former may
+    // abort a session + kill a worker. Keying the teardown on finalStatus alone
+    // re-aborted an already-terminal job on a repeat signal (Claude Code sends
+    // SIGTERM then SIGKILL; a user can mash x) — breaking idempotency.
+    if (didCancel) {
+      canceled.push(jobId);
+      if (snapshot) toTearDown.push(snapshot);
+    } else if (finalStatus) {
+      alreadyDone.push(`${jobId} (${finalStatus})`);
+    }
+  }
+
+  // (2)+(3) For each job WE just canceled, in parallel and time-bounded: abort
+  // its server session, then reap its detached worker's process group. Only
+  // freshly-canceled jobs are touched — never another session's job, never an
+  // already-terminal job's (possibly recycled) pid.
+  await Promise.all(toTearDown.map(async (job) => {
+    if (job.opencodeSessionId) {
+      await withTimeout(
+        Promise.resolve().then(() => client.abortSession(job.opencodeSessionId)),
+        abortTimeoutMs,
+      ).catch(() => { /* server down / slow — the kill below still stops the worker */ });
+    }
+    if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
+      await terminateGroup(job.pid, {
+        graceMs: killGraceMs,
+        isAlive: (p) => isOwnedProcessAlive(p, job.pidStart),
+      }).catch(() => { /* best effort */ });
+    }
+  }));
+
+  return { canceled, alreadyDone };
+}
+
+/**
+ * Install SIGTERM + SIGINT handlers on a FOREGROUND blocking path so pressing
+ * `x` in Claude Code's shells list (or Ctrl-C) does a FULL cascade cancel —
+ * abort the server session(s), kill the detached worker(s), mark the job(s)
+ * canceled — instead of only THIS process dying while the detached worker and
+ * its OpenCode session keep burning the user's money.
+ *
+ * Reentrancy: Claude Code sends SIGTERM and then, after a grace period, SIGKILL;
+ * a user may also mash Ctrl-C. A `cleaning` flag makes the first signal win and
+ * every later one a no-op, so cleanup runs exactly once. A hard deadline
+ * guarantees the process still exits even if cleanup itself wedges (the abort
+ * inside cancelJobsAndCleanup is already bounded; this is belt-and-suspenders).
+ *
+ * @param {string} workspace
+ * @param {() => string[]} getJobIds - the ids THIS call dispatched; ONLY these
+ *   are ever cleaned up, so another session's jobs are never touched
+ * @param {object} [opts] - forwarded to cancelJobsAndCleanup (tests inject client)
+ * @returns {() => void} an uninstaller — call it on the normal (unsignalled) exit
+ */
+export function installForegroundCancelHandler(workspace, getJobIds, opts = {}) {
+  let cleaning = false;
+  const onSignal = (sig) => {
+    if (cleaning) return; // already tearing down — ignore the repeat SIGTERM/KILL/INT
+    cleaning = true;
+
+    const jobIds = (getJobIds() ?? []).filter(Boolean);
+    // 128 + signal number: 143 for SIGTERM, 130 for SIGINT — the conventional
+    // "terminated by signal" exit codes, so the shell sees a real interruption.
+    const exitCode = sig === "SIGINT" ? 130 : 143;
+
+    process.stderr.write(
+      `\n[opencode] ${sig} received — canceling delegated work ` +
+      `(aborting OpenCode session, stopping worker) before exiting…\n`
+    );
+
+    let exited = false;
+    const finish = () => {
+      if (exited) return;
+      exited = true;
+      try {
+        process.removeListener("SIGTERM", onSignal);
+        process.removeListener("SIGINT", onSignal);
+      } catch { /* ignore */ }
+      process.exit(exitCode);
+    };
+    // Absolute ceiling: even if cleanup hangs, `x` must return promptly.
+    const bail = setTimeout(finish, 8000);
+    bail.unref?.();
+
+    cancelJobsAndCleanup(workspace, jobIds, opts)
+      .then((r) => {
+        if (r.canceled.length) {
+          process.stderr.write(`[opencode] canceled: ${r.canceled.join(", ")}\n`);
+        }
+      })
+      .catch(() => { /* swallow — we exit regardless */ })
+      .finally(() => {
+        clearTimeout(bail);
+        finish();
+      });
+  };
+
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+  return () => {
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
+  };
+}
+
 async function handleCancel(argv) {
   const { positional } = parseStrictArgs("cancel", argv);
   const ref = positional[0];
@@ -2061,54 +2293,9 @@ async function handleCancel(argv) {
     return;
   }
 
-  const client = createClient(defaultServerUrl());
-  const canceled = [];
-  const alreadyDone = [];
-
-  for (const job of targets) {
-    // Abort the OpenCode session if we have one.
-    if (job.opencodeSessionId) {
-      try {
-        await client.abortSession(job.opencodeSessionId);
-      } catch {
-        // Server may not be running.
-      }
-    }
-
-    // Signal ONLY a detached background worker. A foreground job's recorded pid
-    // is the dispatcher process itself (the user's live Bash call) — SIGTERMing
-    // it from another session would kill that call mid-output; abortSession above
-    // already makes its sendPrompt return. Ownership is verified via the kernel
-    // start-time fingerprint so a recycled pid is never signalled.
-    if (job.detachedWorker && job.pid && isOwnedProcessAlive(job.pid, job.pidStart)) {
-      try {
-        process.kill(job.pid, "SIGTERM");
-      } catch {
-        // race: gone between the liveness check and the signal
-      }
-    }
-
-    // Compare-and-set INSIDE the state lock: the worker may finish (completed/
-    // failed) during the abortSession round-trip, and a check-then-write outside
-    // the lock could still clobber that terminal result with "canceled".
-    let finalStatus = null;
-    updateState(workspace, (state) => {
-      const j = state.jobs?.find((x) => x.id === job.id);
-      if (!j) return;
-      if (j.status !== "running" && j.status !== "pending") {
-        finalStatus = j.status; // already terminal — leave it
-        return;
-      }
-      j.status = "canceled";
-      j.completedAt = new Date().toISOString();
-      j.errorMessage = "Canceled by user";
-      j.updatedAt = new Date().toISOString();
-      finalStatus = "canceled";
-    });
-
-    if (finalStatus === "canceled") canceled.push(job.id);
-    else if (finalStatus) alreadyDone.push(`${job.id} (${finalStatus})`);
-  }
+  // Same teardown the `x`/Ctrl-C signal handler uses (abort session + kill the
+  // detached worker's process group + CAS canceled) — one shared code path.
+  const { canceled, alreadyDone } = await cancelJobsAndCleanup(workspace, targets.map((j) => j.id));
 
   if (canceled.length) {
     console.log(`Canceled ${canceled.length} job${canceled.length === 1 ? "" : "s"}: ${canceled.join(", ")}`);
