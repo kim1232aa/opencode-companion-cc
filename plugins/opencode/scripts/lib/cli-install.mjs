@@ -189,7 +189,12 @@ if (res.error) {
   console.error(\`opencode-companion: failed to run \${script}: \${res.error.message}\`);
   process.exit(1);
 }
-process.exit(typeof res.status === "number" ? res.status : 0);
+if (typeof res.status === "number") process.exit(res.status);
+// Killed by a signal (status null, signal set): exit 128 + signum, the
+// conventional "terminated by signal" code — never mask a SIGTERM/SIGKILL of the
+// delegated run as a clean exit 0. Bare non-zero if the number can't be resolved.
+const signum = res.signal ? require("node:os").constants.signals[res.signal] : 0;
+process.exit(signum ? 128 + signum : 1);
 `;
 }
 

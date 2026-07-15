@@ -127,6 +127,18 @@ describe("the generated launcher", () => {
     assert.match(text, /PLUGIN_DIR = null/);
     assert.match(text, /\/repo\/plugins\/opencode\/scripts\/opencode-companion\.mjs/);
   });
+
+  it("surfaces a signal-kill of the target as 128+signum, never a false exit 0", () => {
+    const pluginDir = fakeCache(["1.0.0"]);
+    // Make the target script kill ITSELF with SIGTERM. spawnSync then returns
+    // { status: null, signal: "SIGTERM" } — the case the launcher used to report
+    // as a clean exit 0, masking a killed run as success.
+    fs.writeFileSync(scriptIn(pluginDir, "1.0.0"), `process.kill(process.pid, "SIGTERM");\n`);
+    const launcher = path.join(home, "occ-signal.cjs");
+    fs.writeFileSync(launcher, renderLauncher(resolveInstallSource(scriptIn(pluginDir, "1.0.0"))));
+    const res = spawnSync(process.execPath, [launcher], { encoding: "utf8" });
+    assert.equal(res.status, 143, `a SIGTERM-killed target must surface as 143 (128+15), got status=${res.status} signal=${res.signal}`);
+  });
 });
 
 describe("install / uninstall", () => {
