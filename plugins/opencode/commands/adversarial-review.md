@@ -37,20 +37,32 @@ Argument handling:
 - Adversarial reviews support custom focus text. Any text after flags is treated as a focus area.
 - The companion script handles `--adversarial` internally.
 
+Building the command safely (IMPORTANT — do not paste `$ARGUMENTS` raw into a shell string):
+- Split the raw arguments into the recognized FLAGS (`--wait`, `--background`,
+  `--base <ref>`, `--model <ref>`) and the remaining FOCUS text.
+- Pass each flag through unchanged, and pass the focus as ONE argument, quoted so
+  that any shell metacharacters in it (`"`, `` ` ``, `$`, `;`, `&`, `|`,
+  newlines) are taken literally and never interpreted or split. Single-quote it
+  when it contains no single quote; otherwise quote so it survives byte-for-byte.
+- The focus is forwarded to the model verbatim, so it must reach the CLI intact —
+  a broken quote both corrupts the review and can run arbitrary shell in your own
+  session. Never inline the focus unquoted.
+
 Foreground flow:
-- Run:
+- Run (focus quoted as above), e.g.:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" adversarial-review $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" adversarial-review --base main 'the focus text, verbatim'
 ```
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background:
+- Launch the review with `Bash` in the background, building `command` with the
+  same safe quoting (flags through, focus as one quoted argument):
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" adversarial-review $ARGUMENTS`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" adversarial-review --base main 'the focus text, verbatim'`,
   description: "OpenCode adversarial review",
   run_in_background: true
 })

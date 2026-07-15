@@ -39,20 +39,28 @@ Argument handling:
 - `/opencode:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/opencode:adversarial-review`.
 
+Building the command safely (do not paste `$ARGUMENTS` raw into a shell string):
+- This command takes only the recognized flags `--wait`, `--background`,
+  `--base <ref>`, `--model <ref>`. Pass each through unchanged, and quote any flag
+  VALUE that contains a shell metacharacter (`"`, `` ` ``, `$`, `;`, `&`, `|`,
+  spaces) so it is taken literally — never inline an unquoted value into the
+  command string.
+
 Foreground flow:
-- Run:
+- Run (values quoted as above), e.g.:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" review $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" review --base main
 ```
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
 Background flow:
-- Launch the review with `Bash` in the background:
+- Launch the review with `Bash` in the background, building `command` with the
+  same safe quoting:
 ```typescript
 Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" review $ARGUMENTS`,
+  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/opencode-companion.mjs" review --base main`,
   description: "OpenCode review",
   run_in_background: true
 })

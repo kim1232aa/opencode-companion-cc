@@ -639,12 +639,19 @@ async function handleReview(argv) {
 }
 
 async function handleAdversarialReview(argv) {
-  const { options, positional } = parseArgs(argv, {
+  // Focus text is forwarded to the model verbatim, so an undeclared `--flag`
+  // inside it ("review the --verbose path") must survive. parseTaskArgv keeps it
+  // as text (like a task); the plain parseArgs would drop it as an unknown option.
+  const { options, taskText, errors } = parseTaskArgv(argv, {
     valueOptions: ["base", "model"],
     booleanOptions: ["wait", "background"],
   });
+  if (errors.length) {
+    console.error(`Invalid arguments for \`adversarial-review\`:\n  - ${errors.join("\n  - ")}`);
+    process.exit(1);
+  }
 
-  const focus = positional.join(" ").trim();
+  const focus = taskText.trim();
   const workspace = await resolveWorkspace();
   const job = createJobRecord(workspace, "adversarial-review", {
     base: options.base,
@@ -1127,6 +1134,13 @@ export async function handleBatch(argv, deps = {}) {
   // instead of the whole batch dying on a shared pre-flight.
   await ensureServerFn({ cwd: workspace }).catch(() => {});
 
+  // Arm the foreground cancel handler over a LIVE, growing id list BEFORE the
+  // spawn loop, so a SIGTERM landing MID-loop tears down the workers already
+  // spawned — not just the ones a post-loop hook would have known about (which
+  // left early workers orphaned if `x` hit while the batch was still fanning out).
+  const dispatchedIds = [];
+  deps.onDispatched?.(workspace, dispatchedIds);
+
   const dispatched = parsed.items.map((item) => {
     const job = createJobRecord(workspace, "task", {
       agent: item.agent,
@@ -1155,6 +1169,7 @@ export async function handleBatch(argv, deps = {}) {
     upsertJob(workspace, {
       id: job.id, pid: child.pid, pidStart: pidStartTime(child.pid), detachedWorker: true,
     });
+    dispatchedIds.push(job.id); // a live worker exists now — cover it immediately
     return { ...item, jobId: job.id, spawned: true };
   });
 
@@ -1164,12 +1179,6 @@ export async function handleBatch(argv, deps = {}) {
     `[opencode] batch dispatched ${dispatched.length} job(s): ${dispatched.map((e) => e.jobId).join(", ")}\n` +
     "[opencode] blocking until all finish. If this call is cut off, retrieve each with: result <job id>\n"
   );
-
-  // Seam for the CLI to install a foreground cancel handler over the WHOLE batch:
-  // pressing `x` (SIGTERM) must abort every live sub-session and kill every
-  // detached worker, not just the one a single-job handler would know about.
-  // Reported after spawn (so ids/pids exist) and before the blocking wait.
-  deps.onDispatched?.(workspace, dispatched.filter((e) => e.spawned).map((e) => e.jobId));
 
   const entries = await Promise.all(dispatched.map(async (e) => {
     if (!e.spawned) return { ...e, status: "failed" };

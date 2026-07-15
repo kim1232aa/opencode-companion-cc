@@ -1,5 +1,8 @@
-import { describe, it } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   reconcileStrandedJobs,
@@ -8,6 +11,20 @@ import {
   buildStatusSnapshot,
 } from "../plugins/opencode/scripts/lib/job-control.mjs";
 import { upsertJob, loadState } from "../plugins/opencode/scripts/lib/state.mjs";
+
+// These tests write and read the job store. Pin it to a throwaway data root so a
+// real delegation writing to the live store while the suite runs can never make
+// them flake. (node --test runs each file in its own process, so this env is
+// file-scoped.)
+let __savedData;
+before(() => {
+  __savedData = process.env.OPENCODE_COMPANION_DATA;
+  process.env.OPENCODE_COMPANION_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "oc-jobheal-"));
+});
+after(() => {
+  if (__savedData === undefined) delete process.env.OPENCODE_COMPANION_DATA;
+  else process.env.OPENCODE_COMPANION_DATA = __savedData;
+});
 
 function ws() {
   return `/tmp/ochealtest-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;

@@ -123,4 +123,26 @@ describe("batch — onDispatched feeds the foreground cancel handler", () => {
     assert.ok(seen[0].ids.length >= 2, `expected >=2 dispatched ids, got ${seen[0].ids.length}`);
     assert.ok(seen[0].ids.every((id) => typeof id === "string" && id.startsWith("task-")));
   });
+
+  it("arms the cancel handler BEFORE spawning — a mid-loop signal covers early workers", async () => {
+    const w = ws();
+    const order = [];
+    let armedIds = null;
+    await handleBatch(
+      ["--model", "prov/model-a", "--model", "prov/model-b", "do the thing"],
+      {
+        workspace: w,
+        ensureServer: async () => ({}),
+        spawnDetached: () => { order.push("spawn"); return { pid: 900000 + order.length }; },
+        waitForTerminalJob: async (ws2, id) => ({ id, status: "completed", result: "ok" }),
+        readResult: () => ({ rendered: "ok", usage: {} }),
+        onDispatched: (ws2, ids) => { order.push("armed"); armedIds = ids; },
+      }
+    );
+    // The handler must be installed over the id list BEFORE the first worker is
+    // spawned, or a SIGTERM mid-fan-out orphans the workers already running.
+    assert.equal(order[0], "armed", `cancel handler armed after spawning; order: ${order.join(",")}`);
+    // The armed list is the LIVE array — it fills as each worker spawns.
+    assert.ok(armedIds.length >= 2, "the armed id list grew as workers spawned");
+  });
 });

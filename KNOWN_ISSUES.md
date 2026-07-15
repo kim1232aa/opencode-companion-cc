@@ -6,13 +6,15 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
 
 ## Security / hardening
 
-- **`$ARGUMENTS` shell interpolation in `review` / `adversarial-review` / `rescue`.**
-  These commands interpolate free-form user text into a shell command, which is
-  the standard Claude Code slash-command mechanism. Free-text tasks can't be
-  fully sanitized without breaking them. Bounded commands (`status`, `cancel`,
-  `result`) validate the job ref against `^[A-Za-z0-9._:-]+$` in the handler, but
-  a shell-layer safe-command bridge (single-quoted heredoc + argv allowlist) is
-  not yet implemented for them.
+- **Free-form slash-command text reaches a shell.** `review` /
+  `adversarial-review` / `rescue` run in the user's OWN shell (a broken quote
+  runs code in your session, not across a privilege boundary). The command
+  templates now instruct Claude to pass any free-form focus/task text as a single
+  QUOTED argument — never raw-interpolated — so quotes, backticks, `$`, and `;`
+  in it are taken literally instead of breaking the command or running as shell.
+  Residual: this relies on the model quoting correctly rather than a hard argv
+  boundary (e.g. reading the text over stdin). Bounded commands (`status`,
+  `cancel`, `result`) validate the job ref against `^[A-Za-z0-9._:-]+$`.
 - **Full `process.env` is passed to child processes** (`opencode serve`, git,
   the detached worker). Children need `PATH`/`HOME`, so a blanket allowlist is
   intrusive; the delegated model can, in principle, read the parent environment.
@@ -44,12 +46,6 @@ by review but deliberately deferred — each with its rationale. PRs welcome.
   later probe re-recovers it if the server still has the session, otherwise it
   reconciles to `failed`. Low-probability (tiny window) and self-correcting on
   the next successful probe.
-
-- **A few older tests are not state-isolated.** `job-heal`, `job-control` and
-  `status-dashboard` read the real job store instead of a temp
-  `OPENCODE_COMPANION_DATA`, so they can flake if a real delegation happens to
-  be writing state while the suite runs. Re-running is green; the fix is to give
-  them the same temp-dir isolation the newer tests use.
 
 ## Platform / scope
 
