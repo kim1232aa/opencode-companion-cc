@@ -12,7 +12,11 @@ import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState } from "./lib/state.mjs";
 import { isServerRunning, connect } from "./lib/opencode-server.mjs";
 
-const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
+// fileURLToPath(import.meta.url), not import.meta.dirname (Node 20.11+): engines
+// declares >=18.18, and on 18/19 import.meta.dirname is undefined → path.resolve
+// throws. CLAUDE_PLUGIN_ROOT is normally set by the hook runner, but don't rely
+// on it for startup not to crash.
+const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 async function main() {
   const workspace = await resolveWorkspace();

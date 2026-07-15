@@ -80,8 +80,14 @@ export function parseArgs(argv, schema = {}) {
       key = key.slice(0, eqIdx);
     }
     if (valueSet.has(key)) {
-      if (inlineValue !== undefined) {
+      if (inlineValue !== undefined && inlineValue !== "") {
         options[key] = inlineValue;
+      } else if (inlineValue === "") {
+        // `--model=` with nothing after `=`: the `=` explicitly delimited an
+        // EMPTY value (don't look ahead), so treat it as a missing value —
+        // warn like the bare `--model` case instead of silently accepting "".
+        process.stderr.write(`warning: --${key} expects a value but none was given\n`);
+        options[key] = "";
       } else {
         // Don't swallow a following option as this flag's value: `--model
         // --write` must not set model="--write" (which later throws in
@@ -259,6 +265,13 @@ export function parseTaskArgv(argv, schema = {}) {
 
     if (valueSet.has(key)) {
       if (inlineValue !== undefined) {
+        // `--model=` with nothing after `=` is a caller error, not an empty
+        // value: reject it exactly like a bare `--model` with no value, so an
+        // empty string never reaches parseModelRef / the OpenCode dispatch.
+        if (inlineValue === "") {
+          errors.push(`--${key} expects a value but none was given`);
+          continue;
+        }
         options[key] = inlineValue;
         continue;
       }

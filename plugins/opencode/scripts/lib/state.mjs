@@ -119,9 +119,13 @@ export function listWorkspaceStates(opts = {}) {
     if (!entry.isDirectory()) continue;
     const root = path.join(base, entry.name);
 
-    // readJson swallows both "missing" and "unparseable" into null, which is
-    // exactly the semantics we want: a torn write is a skipped repo, not a crash.
-    const state = readJson(path.join(root, "state.json"));
+    // readJson swallows both "missing" and "unparseable" into null (a torn
+    // write is a skipped repo, not a crash). For the `corrupt` flag those two
+    // must NOT be conflated: a dir whose state.json is a torn/unparseable file
+    // is corrupt, but one with no state.json yet (freshly created, or state
+    // deleted) is simply empty — flagging it "corrupt" misleads the operator.
+    const statePath = path.join(root, "state.json");
+    const state = readJson(statePath);
     const jobs = Array.isArray(state?.jobs) ? state.jobs : [];
     const workspace = readJson(path.join(root, "workspace.json"))?.workspace ?? null;
 
@@ -129,7 +133,7 @@ export function listWorkspaceStates(opts = {}) {
       hash: entry.name,
       workspace: typeof workspace === "string" ? workspace : null,
       jobs,
-      corrupt: state === null,
+      corrupt: state === null && fs.existsSync(statePath),
     });
   }
   return out;

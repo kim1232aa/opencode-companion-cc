@@ -35,7 +35,7 @@ Argument handling:
 - Preserve the user's arguments exactly.
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
+- The companion script now truly detaches on `--background` (it re-spawns itself in the background and returns a pointer to `/opencode:status`); Claude Code's `Bash(..., run_in_background: true)` is the other way to background it. The background flow below uses the Bash mechanism.
 - `/opencode:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
 - If the user needs custom review instructions or more adversarial framing, they should use `/opencode:adversarial-review`.
 

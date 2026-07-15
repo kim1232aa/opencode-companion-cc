@@ -85,6 +85,23 @@ describe("listWorkspaceStates", () => {
     const good = groups.find((g) => g.workspace === "/repos/good");
     assert.equal(good.jobs.length, 1, "the healthy repo still paints");
   });
+
+  it("does NOT flag a workspace whose state.json is merely MISSING as corrupt", () => {
+    // A dir that exists but has no state.json yet (freshly created, or state
+    // deleted) is empty — not corrupt. readJson returns null for BOTH cases, so
+    // `corrupt` must additionally check the file actually exists, or the operator
+    // is told a perfectly-fine empty workspace is broken.
+    const dir = path.join(base(), "deadbeefdeadbeef");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "workspace.json"), JSON.stringify({ workspace: "/repos/empty" }));
+    // deliberately NO state.json
+
+    const groups = listWorkspaceStates({ base: base() });
+    const empty = groups.find((g) => g.workspace === "/repos/empty");
+    assert.ok(empty, "the dir is still listed");
+    assert.equal(empty.corrupt, false, "a missing state.json is NOT corruption");
+    assert.deepEqual(empty.jobs, []);
+  });
 });
 
 describe("labelWorkspaces", () => {

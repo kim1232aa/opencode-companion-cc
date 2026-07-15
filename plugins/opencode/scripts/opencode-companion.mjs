@@ -15,14 +15,18 @@ import { isServerRunning, createClient, connect, ensureServer, suggestModelRefs,
 import { resolveWorkspace } from "./lib/workspace.mjs";
 import { loadState, updateState, upsertJob, jobDataPath, jobLogPath, listWorkspaceStates, stateRoot } from "./lib/state.mjs";
 import { buildStatusSnapshot, resolveResultJob, resolveCancelableJobs, matchJobReference, enrichJob, sortJobsNewestFirst, reconcileStrandedJobs, recoverStrandedResults, pidStartTime, isOwnedProcessAlive } from "./lib/job-control.mjs";
-import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled, recordJobRequest, readJobRequest, writeJobRequest } from "./lib/tracked-jobs.mjs";
+import { createJobRecord, runTrackedJob, getClaudeSessionId, isJobCanceled, recordJobRequest, readJobRequest, writeJobRequest, taskPreview } from "./lib/tracked-jobs.mjs";
 import { renderStatus, renderResult, renderReview, renderSetup, formatUsage, formatTrailer, liveSignal, recentActivity } from "./lib/render.mjs";
 import { installCli, uninstallCli, DEFAULT_CLI_NAME } from "./lib/cli-install.mjs";
 import { buildReviewPrompt, buildTaskPrompt } from "./lib/prompts.mjs";
 import { withWorktree } from "./lib/worktree.mjs";
 import { readJson, appendLine } from "./lib/fs.mjs";
 
-const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(import.meta.dirname, "..");
+// fileURLToPath(import.meta.url), not import.meta.dirname: the latter needs Node
+// 20.11+, but package.json engines declares >=18.18 and `occ`/direct-node runs
+// may not inject CLAUDE_PLUGIN_ROOT — on 18/19 the dirname form is undefined and
+// path.resolve then throws at startup.
+const PLUGIN_ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // Single source for the loopback daemon URL (was hardcoded at several sites).
 function defaultServerUrl() {
@@ -597,6 +601,39 @@ function handleCliInstall(options) {
 // Review
 // ------------------------------------------------------------------
 
+/**
+ * Actually background a review when `--background` is given at the CLI.
+ *
+ * The review handlers run foreground (await runTrackedJob), so `--background`
+ * used to be parsed and then ignored — only the Claude slash wrapper (which
+ * launches via `Bash(run_in_background: true)`) truly detached it. A direct
+ * `occ`/node CLI run with `--background` therefore blocked. This re-spawns the
+ * SAME command detached and returns; an env sentinel stops the child from
+ * re-spawning, so it runs the review foreground, creates the job, and writes its
+ * result — reachable via `status`/`result`. The command is forwarded verbatim
+ * (no argv surgery), so an adversarial focus that mentions a flag is never
+ * corrupted. Returns true when it detached (caller should return immediately).
+ *
+ * @param {Record<string, string|boolean>} options
+ * @param {string} label - human label for messages ("review" / "adversarial review")
+ * @param {{ spawn?: Function, forwardArgv?: string[] }} [deps]
+ * @returns {boolean}
+ */
+export function detachReviewIfBackground(options, label, { spawn = spawnDetached, forwardArgv = process.argv.slice(2) } = {}) {
+  if (!options.background || process.env.OPENCODE_REVIEW_BG_CHILD === "1") return false;
+  const scriptPath = path.join(PLUGIN_ROOT, "scripts", "opencode-companion.mjs");
+  const child = spawn("node", [scriptPath, ...forwardArgv], {
+    cwd: process.cwd(),
+    env: { OPENCODE_REVIEW_BG_CHILD: "1" },
+  });
+  if (!child?.pid) {
+    console.error(`Failed to start the background ${label} process.`);
+    process.exit(1);
+  }
+  console.log(`OpenCode ${label} started in the background. Check \`/opencode:status\` or \`/opencode:watch\` for progress.`);
+  return true;
+}
+
 async function handleReview(argv) {
   const { options } = parseArgs(argv, {
     valueOptions: ["base", "model", "max-words"],
@@ -606,6 +643,9 @@ async function handleReview(argv) {
   // unspecified brief passes through as undefined and adds nothing. Matches the
   // Codex frontend's oc_review, which already exposes brief/maxWords.
   const budget = resolveOutputBudget(options);
+
+  // --background at the CLI: detach and return (no-op inside the detached child).
+  if (detachReviewIfBackground(options, "review")) return;
 
   const workspace = await resolveWorkspace();
   const job = createJobRecord(workspace, "review", { base: options.base, model: options.model });
@@ -685,14 +725,19 @@ async function handleAdversarialReview(argv) {
   }
 
   const budget = resolveOutputBudget(options);
+
+  // --background at the CLI: detach and return (no-op inside the detached child).
+  if (detachReviewIfBackground(options, "adversarial review")) return;
+
   const workspace = await resolveWorkspace();
   const job = createJobRecord(workspace, "adversarial-review", {
     base: options.base,
     focus,
     model: options.model,
-    // Surface the focus in `status`/`watch` (taskPreview reads taskText). Inert
-    // for dispatch: the review builds its own prompt from `focus`, not taskText.
-    ...(focus ? { taskText: focus } : {}),
+    // Surface the focus in `status`/`watch`. Set the preview field DIRECTLY
+    // rather than passing taskText: a review runs foreground and has no worker,
+    // so a taskText would only write an inert `.request.json` nothing reads.
+    ...(focus ? { taskPreview: taskPreview(focus) } : {}),
   });
 
   // Foreground blocking: `x`/Ctrl-C must abort the OpenCode session it drives.
