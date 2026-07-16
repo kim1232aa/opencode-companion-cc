@@ -126,6 +126,13 @@ const STRICT_OPTIONS = {
   },
   result: { valueOptions: [], booleanOptions: [] },
   cancel: { valueOptions: [], booleanOptions: [] },
+  // `review` carries NO free-form text (unlike `adversarial-review`, whose focus
+  // is free text and MUST stay lenient), so a typo'd/unknown flag is a mistake,
+  // not content — reject it instead of silently reviewing the working tree.
+  review: {
+    valueOptions: ["base", "model", "max-words"],
+    booleanOptions: ["wait", "background", "brief", "no-brief", "full"],
+  },
 };
 
 /**
@@ -635,10 +642,15 @@ export function detachReviewIfBackground(options, label, { spawn = spawnDetached
 }
 
 async function handleReview(argv) {
-  const { options } = parseArgs(argv, {
-    valueOptions: ["base", "model", "max-words"],
-    booleanOptions: ["wait", "background", "brief", "no-brief", "full"],
-  });
+  // Strict parse (see STRICT_OPTIONS.review): a typo like `--bsae main` used to
+  // warn and then silently review the WORKING TREE instead of the branch.
+  const { options } = parseStrictArgs("review", argv);
+  // `--base` with no ref (bare `--base`, or `--base=`) lands as "" and would
+  // fall back to a working-tree review — the opposite scope. Fail fast.
+  if (options.base === "") {
+    console.error("Invalid arguments for `review`:\n  - --base expects a branch/ref (e.g. --base main)");
+    process.exit(1);
+  }
   // Reviews keep the budget OPT-IN (the JSON schema already bounds them), so an
   // unspecified brief passes through as undefined and adds nothing. Matches the
   // Codex frontend's oc_review, which already exposes brief/maxWords.

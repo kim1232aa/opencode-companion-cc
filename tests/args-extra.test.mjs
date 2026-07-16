@@ -30,6 +30,49 @@ describe("parseTaskArgv — empty inline value", () => {
     assert.equal(errors.length, 0);
     assert.equal(options.model, "deepseek/v4");
   });
+
+  it("does not consume the `--` sentinel as a value option's value", () => {
+    // matchOption("--") is null, so without an explicit guard `--model -- text`
+    // ate the sentinel as model="--" and lost end-of-options. It must error.
+    const { options, errors } = parseTaskArgv(["--model", "--", "--no-verify", "commit"], { valueOptions: ["model"] });
+    assert.ok(errors.some((e) => /--model expects a value/.test(e)), errors.join(" | "));
+    assert.notEqual(options.model, "--");
+  });
+
+  it("keeps the sentinel working when the value IS supplied", () => {
+    const { options, taskText, errors } = parseTaskArgv(
+      ["--model", "gpt-5", "--", "--no-verify", "commit"],
+      { valueOptions: ["model"] }
+    );
+    assert.equal(errors.length, 0);
+    assert.equal(options.model, "gpt-5");
+    assert.equal(taskText, "--no-verify commit"); // dashed tokens after -- are text
+  });
+});
+
+describe("parseArgs — strict review parsing (typo/missing-base no longer silent)", () => {
+  const SCHEMA = {
+    valueOptions: ["base", "model", "max-words"],
+    booleanOptions: ["wait", "background", "brief", "no-brief", "full"],
+  };
+
+  it("flags a typo'd flag as unknown under strict (so review can reject it)", () => {
+    const { unknown, positional } = parseArgs(["--bsae", "main"], { ...SCHEMA, strict: true });
+    assert.deepEqual(unknown, ["bsae"], "the misspelled --base must surface as unknown");
+    assert.deepEqual(positional, ["main"], "and its arg is left positional, not a base");
+  });
+
+  it("surfaces a bare --base as an empty value (the signal review rejects)", () => {
+    const { options } = parseArgs(["--base"], SCHEMA);
+    assert.equal(options.base, "", "bare --base lands as '' -> review fails fast instead of reviewing the working tree");
+  });
+
+  it("accepts a well-formed review invocation", () => {
+    const { options, unknown } = parseArgs(["--base", "main", "--brief"], { ...SCHEMA, strict: true });
+    assert.equal(unknown.length, 0);
+    assert.equal(options.base, "main");
+    assert.equal(options.brief, true);
+  });
 });
 
 describe("parseArgs — more harvested fixes", () => {

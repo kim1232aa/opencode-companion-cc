@@ -279,8 +279,11 @@ export function parseTaskArgv(argv, schema = {}) {
       // must not set model="--write" (which later fails in parseModelRef and
       // silently drops --write). A missing value is a hard error here — the
       // caller asked for a specific model/agent and must not get a default.
+      // `--` is the end-of-options SENTINEL, not a value: matchOption("--") is
+      // null (OPTION_RE needs an alnum after the dashes), so without the explicit
+      // check `--model -- text` would eat the sentinel as model="--".
       const next = argv[i + 1];
-      if (next === undefined || matchOption(next)) {
+      if (next === undefined || next === "--" || matchOption(next)) {
         errors.push(`--${key} expects a value but none was given`);
         continue;
       }
