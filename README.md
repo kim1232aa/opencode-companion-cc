@@ -2,7 +2,7 @@
 
 A **maintained, hardened** OpenCode delegation + review plugin for [Claude Code](https://claude.com/claude-code).
 
-Delegate coding tasks — or run code reviews — from inside Claude Code to [OpenCode](https://github.com/anomalyco/opencode), pointed at **any OpenAI-compatible backend** (a local aggregator, DeepSeek, OpenRouter, Ollama, …). Background jobs, per-task model selection, and status/result/cancel management included.
+Delegate coding tasks — or run code reviews — from inside Claude Code to [OpenCode](https://github.com/anomalyco/opencode), pointed at **any OpenAI-compatible backend** (a local aggregator, DeepSeek, OpenRouter, Ollama, …). Background jobs, parallel fan-out, per-task model selection, session resume, and status/result/cancel management included.
 
 > **Why this fork exists.** It is a direct fork of
 > [tasict/opencode-plugin-cc](https://github.com/tasict/opencode-plugin-cc)
@@ -15,22 +15,21 @@ Delegate coding tasks — or run code reviews — from inside Claude Code to [Op
 > ([suharvest](https://github.com/suharvest/opencode-plugin-cc),
 > [JohnnyVicious](https://github.com/JohnnyVicious/opencode-plugin-cc)),
 > adds original fixes, and — crucially — ships tests for the modules where those
-> bugs actually lived. See **[What's Fixed](#whats-fixed-vs-upstream)**.
+> bugs actually lived. See **[docs/WHATS-FIXED.md](docs/WHATS-FIXED.md)** and the git log.
 
 ## What You Get
 
-- `/opencode:rescue` — delegate a task to OpenCode (`--model`, `--agent`, `--resume`, `--fresh`, `--background`, `--worktree`). Blocks and returns the actual result by default (via `wait-and-result`); `--background` is fire-and-forget. A transient 500 / dropped connection / stall is retried on a fresh session; the run ends with a **one-line token/model/session trailer**.
-- `/opencode:review` / `/opencode:adversarial-review` — read-only or steerable challenge reviews (both honor `--model`); the model is handed the real review-output JSON schema.
-- `/opencode:status`, `/opencode:result`, `/opencode:cancel` — manage background jobs. `status` shows a **live token heartbeat and the commands OpenCode is actually running** (bash/edit/read); `cancel` with no job id cancels **all** of the session's running jobs.
-- `/opencode:setup` — check install/auth, toggle the review gate
-
-Every delegated run also reports OpenCode-side **token usage and cost** (input / output / reasoning / cache, plus turn count and `$` when the backend prices it). Write-capable runs can opt into `--worktree` for **git-worktree isolation** so a concurrent editing session can't be clobbered by OpenCode's snapshot/undo.
+- **Task delegation** (`/opencode:rescue`) — foreground with the real result, background with a job id, or a parallel **batch** fan-out; per-task `--model`, read-only `--agent plan`, session **resume**, git-worktree **isolation**, and an output **budget** that keeps answers brief by default.
+- **Reviews** (`/opencode:review`, `/opencode:adversarial-review`) — read-only reviews of the working tree or a branch diff, backed by a real JSON output schema; the adversarial variant takes free-form focus text.
+- **Job management** (`/opencode:status`, `/opencode:result`, `/opencode:cancel`) — live token heartbeat, the commands OpenCode is actually running, crash-safe result recovery, cancel-all.
+- **The `occ` terminal CLI** — a live cross-repo panel of every delegation, for **zero Claude tokens**.
+- Every run ends with a one-line **token/model/session trailer**; all delegated work is billed to the OpenCode-side backend, not your Claude quota.
 
 ## Requirements
 
 - [Claude Code](https://claude.com/claude-code) (CLI, desktop app, or IDE extension)
 - [OpenCode](https://github.com/anomalyco/opencode) installed (`npm i -g opencode-ai` or `brew install opencode`)
-- A configured AI provider in OpenCode (see below)
+- A configured AI provider in OpenCode (see [Install](#install))
 - Node.js 18.18 or later
 
 ## Install
@@ -85,81 +84,57 @@ Then delegate with `/opencode:rescue --model my-endpoint/some-model "…"`.
 /reload-plugins
 ```
 
-## What's Fixed vs upstream
+## Usage
 
-| Area | Bug in upstream | Fix |
-|---|---|---|
-| Long tasks | Any task &gt;5 min died with an opaque `fetch failed` — Node's bundled undici has a hidden 300 s `bodyTimeout` that `AbortSignal.timeout()` cannot override | Prompt POST goes through `node:http` (no default body timeout), bounded only by an explicit, env-tunable wall-clock timer |
-| Model routing | Current OpenCode REST requires `model` as a `{providerID, modelID}` object; the plugin sent a raw string → every `--model` call 400'd | `parseModelRef()` splits on the first `/` and sends the object form |
-| Read-only | `--write` was a dead flag that always evaluated true; even `--agent plan` left the runtime believing it had write access | `isWrite` derived from the resolved agent (`plan` ⇒ read-only) |
-| Prompt fidelity | The rescue subagent was permitted to "tighten" the prompt, silently compressing long task text before forwarding | Byte-for-byte forwarding mandated in both the agent def and its runtime skill |
-| `--model` in reviews | `/opencode:review` / `--adversarial-review` parsed only `--base`; `--model` was swallowed | `--model` threaded through both review handlers |
-| Provider list | `/opencode:setup` assumed `/provider` returned an array; new OpenCode returns `{all, default, connected}` → always empty | Handles both shapes |
-| Headless permission hang | An `external_directory` (or other) permission prompt in a headless dispatch is never answerable → 5–10 min hang | A watcher polls `/permission` and auto-rejects un-answerable prompts, so the agent gets a normal tool-error it can react to |
-| Concurrent job state | Unlocked read-modify-write of `state.json` lost job updates under parallel background jobs (~1/3 of the time at 5–8 concurrent) | A filesystem lock (`withFileLock`) serializes state writes |
-| websearch | The `websearch` tool is a no-op on custom providers unless `OPENCODE_ENABLE_EXA=1` | Set on the managed `opencode serve` process |
-| No token visibility (2.0.1) | `extractResponseText` discarded `response.info`, so the OpenCode-side token/cost of a delegated run was never surfaced | `getSessionUsage()` sums assistant-message `tokens`/`cost` across the session; every dispatch path renders a token-usage line (derives `total` when a build omits it) |
-| Recycled-PID kill (2.0.1) | `cancel` and the stranded-job reaper checked only pid *liveness*; a reused pid could be signalled/mis-reconciled — and the comment falsely claimed an ownership check | `pidStartTime()` fingerprints the worker via `/proc/<pid>/stat` field 22; `isOwnedProcessAlive()` only treats a pid as ours when the start-time matches (bare-liveness fallback off-Linux) |
-| Untracked background pid (2.0.1) | `rescue --background` never recorded its detached worker's pid, so `cancel` couldn't stop it and death-detection couldn't fire | The pid + start-time are persisted for background jobs too |
-| Worktree isolation (2.0.1) | Running `build` in a live repo let OpenCode's git snapshot/undo revert unrelated concurrent edits; a first cut piped the patch via a stdin that `runCommand` ignores → nothing applied back | Opt-in `--worktree` runs in a throwaway detached worktree, then applies the captured patch back through a temp file (refusing a truncated/oversized diff), surfacing conflicts instead of clobbering |
-| Dead `--scope` flag (2.0.1) | `/opencode:review` advertised `--scope auto\|working-tree\|branch` but the value was parsed and never used | Removed from parsing and docs; `--base` is the real control |
-| File-lock stolen from a live holder (2.0.2) | `withFileLock` reclaimed a lock on 60s mtime age even when the owner pid was provably alive — breaking mutual exclusion for any critical section >60s (contradicting its own doc comment) | Owner token now carries a `pid:start:nonce` fingerprint; reclaim only when the holder is dead or the pid was recycled (start-time mismatch), never on age while it's the same live process |
-| `cancel` clobbers a finished job (2.0.2) | A worker could complete during `cancel`'s async `abortSession`, then `cancel` unconditionally overwrote its status → a completed job mislabeled `canceled` | Re-reads the job before writing; leaves a terminal status untouched |
-| Spawn failure hangs for the full timeout (2.0.2) | If the detached worker failed to spawn (no pid), `wait-and-result` had nothing to poll and blocked up to 35 min before reporting timeout | Fails fast when the child has no pid, marking the job failed immediately (both foreground-wait and background paths) |
-| Value option ate the next flag (2.0.2) | `--model --write` set `model="--write"` and silently dropped `--write`, later throwing in `parseModelRef` | `parseArgs`/`extractTaskText` refuse to consume a `--`-prefixed token as a value |
-| Worktree silent data loss (2.0.2) | `withWorktree` didn't check `git add`/`git diff` exit codes; a failure yielded an empty patch and the task's changes were deleted with the worktree | Checks both exit codes, preserves the worktree, and raises instead of discarding; also runs in the matching subdir when `dir` is a repo subpath, and gives `runCommand` a total timeout + SIGKILL escalation |
-| Cost as numeric string dropped (2.0.2) | `getSessionUsage` counted `info.cost` only when `typeof === "number"`, silently zeroing a `"0.0123"`-style string | Lenient `Number()` + `Number.isFinite` parse |
-| Dead worker lost its result (2.0.3) | A background worker hard-killed (SIGKILL/OOM) after sending its prompt couldn't write a result; the finished OpenCode session's output was unreachable and the job showed a phantom "running" | `status`, `result`, the SessionEnd hook, and `wait-and-result` now probe the server (`getSessionResult`) and salvage a dead worker's answer, marking the job `completed` (flagged `recovered`) before reconciling the rest to `failed` |
-| Recovery correctness (2.0.3) | Naively taking the session's last assistant text could recover a half-generated turn, an errored turn, or (on a reused `--resume-last` session) the *previous* task's answer; and a still-generating session was failed prematurely | Only a turn with `time.completed` set, no `info.error`, and `time.created` newer than the job's dispatch is recovered; a still-active session keeps the job alive (`awaitingServer`) instead of failing it; probes use a short timeout after one health check, so `status` can't block for minutes |
-| Foreign service mistaken for the server (2.0.3) | `isServerRunning` treated any 200 on `/global/health` as "OpenCode is up", so an unrelated service squatting on the port could receive dispatched sessions | Requires `healthy === true` (a `{ healthy: false }` or foreign 200 no longer counts); server port unified across dispatch and recovery via `OPENCODE_SERVER_PORT` |
-| Worktree destroyed a failed task's changes (2.0.5) | If the task errored (HTTP timeout, API error) AFTER modifying files, the worktree was still removed — partial changes silently destroyed; a failed `git worktree add` also silently ran in the live workspace, defeating the requested isolation | A failing task preserves the worktree (path reported); a failed worktree add now errors instead of falling back |
-| Cold-start hang & lingering half-started server (2.0.5) | After spawning `opencode serve`, the dispatcher's open stdout/stderr pipes kept the Node event loop alive — it finished its work then hung instead of exiting; a startup timeout also left the half-started child running | Pipes are destroyed once startup resolves; a timed-out startup SIGTERMs the child |
-| `cancel` could kill the user's live call (2.0.5) | A foreground job's recorded pid is the dispatcher itself, so a cancel from another session SIGTERMed the user's in-flight Bash call; the terminal-status check also raced outside the lock | Only detached background workers are signalled (foreground runs are stopped via `abortSession`); the canceled write is now a compare-and-set inside the state lock |
-| Review false-green on staged/untracked work (2.0.5) | Working-tree review ran plain `git diff` (unstaged only) — a staged-only change set reviewed as "no changes"; git failures returned empty context instead of erroring; `--base` was spliced into git argv unvalidated (option injection) | Diffs against `HEAD` (staged+unstaged), git failures throw, and `--base` must match a safe-ref pattern |
-| Task text corruption (2.0.5) | `extractTaskText` stripped EVERY `--token`, so a task like "run git commit --no-verify" lost `--no-verify` — breaking the byte-for-byte forwarding promise | Only declared routing flags are stripped; unknown `--tokens` stay in the task text |
-| Grandchild processes wedged the caller (2.0.5) | Timeout/overflow kills signalled only the direct child; a `sh -c '…'` grandchild kept the output pipes open and `close` never fired | Children run in their own process group; kills signal the whole group (SIGTERM→SIGKILL) |
-| Assorted (2.0.5) | `--fresh` didn't override `--resume-last`; recovery probes could still block on a slow usage call; a missing `time.created` slipped past the dispatch-time filter; SessionEnd hook's 5s timeout was shorter than recovery itself; `/result` could fall back to another session's job; state fell into world-readable `/tmp`; three dead client methods formed a false capability surface | All fixed: fresh override, 8s probe timeouts, strict since-filter, 60s hook timeout, strict session scoping, 0700/0600 state permissions, dead APIs removed |
-| Token progress heartbeat (2.0.5) | During a 15–30 min generation the job log only changed on phase transitions, so `status` couldn't distinguish "generating" from "stuck" | The worker logs `heartbeat: N tokens so far` every 30s (live server poll); watch it climb via `/opencode:status` |
-| Intermittent failures aborted the run (2.1.0) | A transient OpenCode 500, a dropped connection, or a stall (no token progress) failed the whole delegation, even though these are intermittent | `dispatchWithRetry` retries up to 3× on a fresh session (one interval both heartbeats and trips the stall watchdog); an empty turn is still failed immediately — it's deterministic, and retrying only re-burns cached input |
-| Cancel re-ran the task (2.1.0) | An external cancel aborted the OpenCode session, which surfaced to the retry loop as a transient throw — so a (possibly write) task was re-run on a fresh session | Cancel marks the job canceled in shared state; `dispatchWithRetry`'s `shouldStop` check observes it and aborts with `Delegation canceled` instead of retrying |
-| Opaque subtasks (2.1.0) | `status` showed only a token count, so you couldn't see what OpenCode was doing | The dispatch heartbeat streams OpenCode's own tool calls (bash/edit/read) into the job log; `status` shows the latest ones next to the token heartbeat |
-| Verbose trailer (2.1.0) | Every delegated run ended with a multi-line `---`/Tokens/Model/session footer | Collapsed to a single-line trailer (model-mismatch ⚠️ and empty-output warnings preserved); the full breakdown stays in `/opencode:result`, or set `OPENCODE_COMPANION_VERBOSE_TRAILER=1` |
-| Unbacked review schema (2.1.0) | The review prompts said "return JSON matching the review-output schema" but never actually included the schema | `buildReviewPrompt` appends the real schema (best-effort file read, compact inline fallback) so the model's output matches what the renderer consumes |
-| Session-scoping no-op + audit fixes (2.1.0) | `getClaudeSessionId` read a non-existent `CLAUDE_SESSION_ID`, so per-session scoping silently matched nothing; the Stop-gate hook mis-parsed stdin; a review-prompt placeholder could be expanded from injected diff/focus text | Reads the real `CLAUDE_CODE_SESSION_ID`; the hook safely takes `last_assistant_message`; template placeholders are filled in a single pass |
+### Delegate a task — `/opencode:rescue`
 
-Additional hardening (background-job self-heal, recursive-delegation guard,
-error classification, and expanded test coverage) is consolidated from the
-suharvest and JohnnyVicious forks — see the [NOTICE](NOTICE) file for attribution.
+```
+/opencode:rescue fix the failing tests in src/parser
+/opencode:rescue --background --model my-endpoint/some-model "translate README.md to Japanese"
+/opencode:rescue --agent plan "explain how the retry logic in lib/http.mjs works"   # read-only
+```
 
-## Delegation Cost — dispatch from the main loop, not from a subagent
+- **Foreground (default):** blocks and prints the real result plus the token trailer.
+- **`--background`:** returns a job id instantly; collect later with `/opencode:result`.
+- **`--agent plan`** is the only read-only mode; the default `build` agent has full write access.
+- **`--resume`** continues this session's last OpenCode session (the code it already read stays cached — follow-ups are ~10× faster); `--fresh` forces a new one. Only completed/running jobs are resume candidates.
+- **`--worktree`** runs a write task in an isolated throwaway git worktree and applies the changes back — a concurrent editing session can't be clobbered, and a failed apply preserves the worktree + patch instead of reporting false success.
+- **Output budget:** answers are `--brief` by default (the answer re-enters Claude's context every turn; the work itself is free). `--full` lifts it, `--max-words <n>` caps it hard.
 
-Delegating is a **Bash call**, not a reasoning task. Route it accordingly:
+Fan out several independent tasks in ONE command with `batch` (per-item flags after each `--task`):
 
-| How you delegate | Claude tokens | Use it when |
-| --- | --- | --- |
-| Main loop → `task --background "<task>"`, later `result <id>` | **≈200** | **Default.** Returns a job id instantly; the main loop never blocks. |
-| Main loop → N × `task --background` in one turn | ≈200 × N | Parallel fan-out of independent tasks. |
-| Main loop → `wait-and-result "<task>"` (foreground Bash) | ≈200 + result | You want the answer in this turn. |
-| `Task(opencode:opencode-rescue)` subagent | **≈10,000 fixed** | Only when the delegation itself needs multi-step reasoning (probe → decide → re-dispatch), or a very long result must be summarized before it enters the main context. |
+```bash
+node "$CLAUDE_PLUGIN_ROOT/scripts/opencode-companion.mjs" batch \
+  --task "add JSDoc to lib/args.mjs" \
+  --task "write a unit test for parseModelRef" --model my-endpoint/other-model
+```
 
-The subagent's ~10k is paid **before any useful work happens** — it is the agent
-definition, its skills, and the subagent's own turns; the real work runs on
-OpenCode and costs OpenCode tokens either way. Four parallel rescue subagents that
-each wrap a single `Bash` call burn **~40k Claude tokens** and buy nothing over
-four `Bash` calls. The wrapper only pays for itself when it absorbs more context
-than it costs.
+### Reviews — `/opencode:review` and `/opencode:adversarial-review`
 
-`opencode-companion.mjs --help` lists every subcommand and flag.
+```
+/opencode:review --base main            # branch diff vs main (working tree if omitted)
+/opencode:adversarial-review focus on the cancel/retry race conditions
+```
 
-## Slash Commands
+Both are strictly read-only (`plan` agent), honor `--model` and the output-budget
+flags, and hand the model the actual review-output JSON schema so the findings
+render structurally. `review` takes no free text and rejects unknown flags
+(a typo like `--bsae` fails fast instead of silently reviewing the wrong scope);
+`adversarial-review` treats everything after the flags as focus text.
 
-- `/opencode:rescue` — delegate a task to OpenCode. Dispatches directly from the main loop (no subagent). Blocks and returns the real result by default; `--background` is fire-and-forget. `--model <provider/model>`, `--agent <build|plan>`, `--resume`, `--fresh`, `--background`, `--worktree`.
-- `/opencode:review` — read-only OpenCode review. `--base <ref>`, `--model <id>`, `--wait`, `--background`.
-- `/opencode:adversarial-review` — steerable challenge review; accepts custom focus text. `--model <id>`.
-- `/opencode:status` / `/opencode:result` / `/opencode:cancel` — manage background jobs.
-- `/opencode:setup` — check OpenCode install/auth; enable/disable the review-gate hook; install the `occ` CLI launcher.
+### Manage jobs — `status` / `result` / `cancel`
 
-## The `occ` CLI — watch delegations from a terminal, for zero Claude tokens
+```
+/opencode:status        # live heartbeat: token count climbing = generating; frozen = stuck
+/opencode:result        # newest finished job (or: result <job id>)
+/opencode:cancel        # no id = cancel ALL of this session's running jobs
+```
+
+- `status` shows the OpenCode-side commands each job is running (`bash: npm test` …), so you can tell *working* from *wedged*.
+- If a background worker dies (OOM, kill), `status`/`result` probe the server and **recover the finished answer** instead of losing it.
+- `cancel` aborts the server session, kills the detached worker's process group, and never leaves partial output behind.
+
+### The `occ` CLI — watch delegations from a terminal, for zero Claude tokens
 
 The companion is a plain Node CLI, so you can drive it from a terminal instead of
 from Claude. Install a short launcher once:
@@ -169,10 +144,9 @@ from Claude. Install a short launcher once:
 ```
 
 It refuses to shadow an existing command (`occ`, not `oc` — that one is the
-OpenShift CLI); pass `--cli-name <name>` if you want another name, and
-`--uninstall-cli` to remove it. The launcher **resolves the newest installed
-plugin version at run time**, so upgrading the plugin never breaks it — no version
-is baked in.
+OpenShift CLI); pass `--cli-name <name>` for another name, `--uninstall-cli` to
+remove it. The launcher resolves the newest installed plugin version at run
+time, so upgrading the plugin never breaks it.
 
 ```bash
 occ watch                   # LIVE panel of every delegation, in EVERY repo
@@ -181,10 +155,9 @@ occ status                  # this repo's jobs, once
 occ result <job id>
 ```
 
-`occ watch` is the cross-repo view: job state is stored per workspace, so
-`status --watch` only ever sees the repo you are standing in — a delegation
-dispatched from another repo simply never showed up. `watch` aggregates them all
-and tags each row with the repo it belongs to:
+`occ watch` is the cross-repo view — job state is stored per workspace, so plain
+`status` only sees the repo you are standing in. `watch` aggregates every
+workspace and tags each row with its repo:
 
 ```
 OpenCode delegations · live — refreshed 05:06:50, every 3s · Ctrl-C to exit
@@ -202,18 +175,90 @@ OpenCode delegations · live — refreshed 05:06:50, every 3s · Ctrl-C to exit
   Error: worker (pid 4242) exited without completing
 ```
 
-It reads local job state only — no server probe, no writes — so it never disturbs
-the jobs it is showing you, and it costs **zero Claude tokens**.
+It reads local job state only — no server probe, no writes — so it never
+disturbs the jobs it shows, and it costs zero Claude tokens.
 
-Every token number it prints is OPENCODE-side usage: the work you delegated. It
-is not billed to your Claude context or quota.
+## Typical Flows
 
-## Review Gate
+**Quick question, answer this turn.** Foreground `/opencode:rescue --agent plan "…"` — blocks a few seconds, prints the answer and the trailer. Done.
 
-When enabled via `/opencode:setup --enable-review-gate`, a Stop hook runs a
-targeted OpenCode review on Claude's response and blocks the stop if issues are
-found. It is **off by default**; note it can create long-running loops and drain
-usage limits when on.
+**Long task, keep working, get woken on completion.** Dispatch with `--background`, then run `wait-and-result <job id>` in a *tracked background shell* (Claude Code's `run_in_background`). The shell exits when the job finishes, and the harness notifies the conversation — this is the only wake-up mechanism; bare `--background` never calls back. (The dispatch output prints this exact recipe.)
+
+**Parallel fan-out.** One `batch` command with N `--task` items runs N concurrent workers and prints all results with one summary — the cheapest way to run independent subtasks.
+
+**Iterating on one codebase.** First delegation reads the code (slow); follow-ups with `--resume` reuse that session's cache — measured ~10× faster with ~96% cache-read on real runs.
+
+**Pre-merge review.** `/opencode:review --base main --background`, keep working, `/opencode:result` when it lands.
+
+## Delegation Cost — dispatch from the main loop, not from a subagent
+
+Delegating is a **Bash call**, not a reasoning task. Route it accordingly:
+
+| How you delegate | Claude tokens | Use it when |
+| --- | --- | --- |
+| Main loop → `task --background "<task>"`, later `result <id>` | **≈200** | **Default.** Returns a job id instantly; the main loop never blocks. |
+| Main loop → N × `task --background` in one turn (or `batch`) | ≈200 × N | Parallel fan-out of independent tasks. |
+| Main loop → `wait-and-result "<task>"` (foreground Bash) | ≈200 + result | You want the answer in this turn. |
+| Main loop → `task --background`, then `wait-and-result <id>` in a background shell | ≈200 + result on wake | Notify-on-completion for long tasks. |
+| `Task(opencode:opencode-rescue)` subagent | **≈10,000 fixed** | Only when the delegation itself needs multi-step reasoning, or a very long result must be summarized before entering the main context. |
+
+The subagent's ~10k is paid **before any useful work happens**. Four parallel
+rescue subagents that each wrap a single `Bash` call burn ~40k Claude tokens and
+buy nothing over four `Bash` calls.
+
+`opencode-companion.mjs --help` lists every subcommand and flag.
+
+## Configuration
+
+| Env var | Default | What it does |
+| --- | --- | --- |
+| `OPENCODE_SERVER_PORT` | `4096` | Port of the managed `opencode serve` daemon (dispatch, recovery, and cancel all agree on it). |
+| `OPENCODE_COMPANION_PROMPT_TIMEOUT_MS` | 30 min | Hard wall-clock cap on a single prompt turn. |
+| `OPENCODE_COMPANION_WAIT_TIMEOUT_MS` | 35 min | How long `wait-and-result` waits before giving up (the job keeps running). |
+| `OPENCODE_COMPANION_DATA` | tmpdir | Override the job-state directory (also how two frontends can share one store). |
+| `OPENCODE_COMPANION_VERBOSE_TRAILER` | off | `1` restores the multi-line token breakdown instead of the one-line trailer. |
+| `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | unset | Basic auth for the loopback server (loopback HTTP — see KNOWN_ISSUES). |
+
+**Review gate:** `/opencode:setup --enable-review-gate` installs a Stop hook that
+runs a targeted OpenCode review on Claude's response and blocks the stop if
+issues are found. **Off by default** — it can loop long and drain usage limits.
+
+## FAQ
+
+**Claude Code shows "↓ N tokens" — is the delegation costing me Claude tokens?**
+No. That number is what the *turn* cost the host. The delegated work runs on the
+OpenCode backend; the trailer's token line is that OpenCode-side usage. Only the
+returned *answer text* enters your Claude context (which is why answers are
+brief by default).
+
+**My foreground call was cut off at 10 minutes.**
+That's the Bash tool's ceiling, not a failure — Claude Code moves the call to
+the background without signaling it, the detached worker keeps running, and the
+dispatch line printed the job id: collect with `/opencode:result <id>`. (A
+SIGTERM/SIGINT cut-off — pressing `x`/Ctrl-C — CANCELS the job instead; that's
+the deliberate cancel semantics. Expect >10 min? use `--background` + the
+notify-on-completion flow above.)
+
+**What happens if the worker or the server dies mid-task?**
+`status`/`result` probe the server and recover a finished answer (marked
+`recovered`); a still-generating session keeps the job alive; only a genuinely
+lost run reconciles to `failed` — with the reason in the job log.
+
+**My model id contains slashes — how do I write the ref?**
+`<providerID>/<modelID>`, split on the FIRST slash; the model id may itself
+contain slashes (`my-endpoint/org/model-x`). The provider id comes from your
+`opencode.jsonc` — not necessarily the display name OpenCode's UI shows. A ref
+that only dropped the provider prefix is auto-fixed when unambiguous.
+
+**Does `cancel` really stop the work?**
+Yes — it marks the job canceled, aborts the OpenCode session server-side
+(time-bounded), and TERM→KILLs the detached worker's process group. Partial
+output is not preserved.
+
+**Why is the answer so short?**
+Brief mode is the default on purpose: the answer re-enters Claude's context on
+every later turn, so an unbounded answer is the one part of a delegation that
+keeps costing. Use `--full` or `--max-words <n>` when you need the long form.
 
 ## Architecture
 
@@ -221,12 +266,15 @@ The plugin talks to `opencode serve` over its HTTP REST API. The long-lived
 prompt POST uses `node:http` (not global `fetch`) to avoid undici's hidden 5-min
 body timeout; short control calls use `fetch`. The server is auto-started and
 managed by the companion scripts. Background tasks run as detached workers whose
-state is tracked on disk under `CLAUDE_PLUGIN_DATA`.
+state is tracked on disk (0700/0600). A stall watchdog aborts turns with no
+token progress and retries on a fresh session; crash recovery salvages finished
+answers from the server.
 
 ## Development
 
 ```
-npm test          # run the test suite
+npm test          # full suite; includes a parity gate that fails if the shared
+                  # lib drifts from the sibling opencode-companion-codex repo
 ```
 
 ## License

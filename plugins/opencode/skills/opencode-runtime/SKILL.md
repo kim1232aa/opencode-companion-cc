@@ -31,8 +31,10 @@ inspection, no follow-up work, never `setup`/`review`/`adversarial-review`/`canc
 - **Subcommand:** `wait-and-result` by default (blocks, prints the real result);
   `task --background` only if fire-and-forget was explicitly requested.
 - **Foreground `Bash`, `timeout: 600000`** (the maximum). Never `run_in_background`;
-  never reply "I'll check back later". A cut-off call on a long task is expected and
-  recoverable — poll `result <id>` with the job id from the stderr dispatch line.
+  never reply "I'll check back later". A signal-less cut-off (Claude Code backgrounds
+  a timed-out Bash) is recoverable — poll `result <id>` with the id from the stderr
+  dispatch line. A SIGTERM/SIGINT cut-off CANCELS the job (deliberate `x` semantics);
+  expect >10 min? dispatch `task --background` and poll instead.
 - **Task text byte-for-byte.** No summarizing, shortening, or paraphrasing.
 - **Flags are routing controls, never task text**: `--model`, `--agent`, `--worktree`,
   `--background`/`--wait`, `--resume`/`--fresh`. Strip them from the text; map them

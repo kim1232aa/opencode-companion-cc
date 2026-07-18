@@ -36,14 +36,20 @@ nothing over four Bash calls.
   more.
 - The companion itself waits up to **35 minutes** internally (override with
   `--timeout-ms` or `OPENCODE_COMPANION_WAIT_TIMEOUT_MS`). So a task longer than
-  10 minutes **will** have its Bash call cut off. **That is expected, not a
-  failure**, and the recovery flow is designed for it:
-  1. The command prints `[opencode] job <id> dispatched…` to stderr at the start.
-     Keep that id.
-  2. The detached worker keeps running after the Bash call dies.
-  3. Poll with further `Bash` calls to `result <id>` (checking `status` in
-     between — the job log shows `heartbeat: N tokens so far` while the model is
-     still generating) until the result is ready, then return it.
+  10 minutes **will** have its Bash call cut off. What happens then depends on
+  HOW the harness ends the call:
+  - **Moved to background without a signal** (current Claude Code behavior): the
+    call keeps running detached; nothing is lost. Poll `result <id>` with the id
+    from the `[opencode] job <id> dispatched…` stderr line (checking `status` in
+    between — the job log shows `heartbeat: N tokens so far` while generating).
+  - **Killed with SIGTERM/SIGINT** (a user pressing `x`/Ctrl-C, or a harness
+    that signals on timeout): the dispatch-and-wait path treats the signal as a
+    CANCEL — deliberately (`x` must stop the server-side work too) — so the job
+    is canceled and the delegated work stops. It is NOT recoverable afterwards.
+  - Therefore, for a task you expect may exceed 10 minutes, prefer
+    `task --background` and poll `result <id>` in follow-up Bash calls — the
+    await-existing path installs no cancel handler, so the worker survives any
+    cut-off of the polling call.
 - **Never** run the dispatch with `run_in_background`, and **never** answer with
   "I'll wait for the result" / "I'll check back later". Either return the
   blocking call's stdout, or actively fetch it with `result <id>`.

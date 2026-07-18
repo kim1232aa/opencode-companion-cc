@@ -694,6 +694,10 @@ async function runReviewJob({ type, label, errorLabel, sessionTitle, adversarial
     const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
       report("starting", "Connecting to OpenCode server...");
       const client = await connect({ cwd: workspace });
+      // Same model validation/auto-prefix as handleTask — without it a bare
+      // "--model gpt-x" died in parseModelRef, was retried as a transport error,
+      // and failed with a cryptic message instead of "Did you mean …?".
+      model = await resolveModelAvailable(client, model);
 
       const prompt = await buildReviewPrompt(workspace, {
         base,
@@ -708,6 +712,7 @@ async function runReviewJob({ type, label, errorLabel, sessionTitle, adversarial
 
       // Retry a transient 500 / hang on a fresh session; an empty (deterministic)
       // turn fails honestly. dispatchWithRetry owns the heartbeat + stall watchdog.
+      const dispatchedAt = Date.now(); // usage window: this run's turns only (a RESUMED session carries the previous task's turns)
       const dispatch = await dispatchWithRetry({
         client, prompt, agent: "plan", model, // read-only agent for reviews
         extract: extractResponseText, log,
@@ -721,13 +726,19 @@ async function runReviewJob({ type, label, errorLabel, sessionTitle, adversarial
 
       report("finalizing", "Processing review output...");
 
-      // Try to parse structured output
+      // Try to parse structured output. Only render as a review when the parse
+      // actually LOOKS like one — tryParseJson's brace-slice fallback can latch
+      // onto an incidental JSON fragment inside prose, and rendering that would
+      // discard the real answer text around it.
       const text = extractResponseText(response);
       const structured = tryParseJson(text);
-      const usage = await client.getSessionUsage(sessionId).catch(() => null);
+      const reviewShaped = structured && (Array.isArray(structured)
+        ? structured.some((x) => x && typeof x === "object")
+        : (Array.isArray(structured.findings) || structured.verdict !== undefined || structured.summary !== undefined));
+      const usage = await client.getSessionUsage(sessionId, { since: dispatchedAt }).catch(() => null);
 
       return {
-        rendered: structured ? renderReview(structured) : text,
+        rendered: reviewShaped ? renderReview(structured) : text,
         raw: response,
         structured,
         usage,
@@ -866,6 +877,7 @@ async function handleTask(argv) {
         log(`Agent: ${agentName}, Write: ${isWrite}, Prompt: ${prompt.length} chars, Model: ${options.model ?? "(provider default)"}, Brief: ${brief === false ? "off" : "on"}${maxWords ? `, MaxWords: ${maxWords}` : ""}`);
 
         // Retry a transient 500 / empty turn / hang on a fresh session.
+        const dispatchedAt = Date.now(); // usage window: this run's turns only (a RESUMED session carries the previous task's turns)
         const dispatch = await dispatchWithRetry({
           client, prompt, agent: agentName, model: options.model,
           extract: extractResponseText, log, resumeSessionId,
@@ -880,7 +892,7 @@ async function handleTask(argv) {
         report("finalizing", "Processing task output...");
 
         const text = extractResponseText(response);
-        const usage = await client.getSessionUsage(sessionId).catch(() => null);
+        const usage = await client.getSessionUsage(sessionId, { since: dispatchedAt }).catch(() => null);
 
         // Get changed files if write mode
         let changedFiles = [];
@@ -1479,7 +1491,10 @@ async function awaitJobResult(workspace, jobId, timeoutMs) {
 
   if (st.status === "completed") {
     const data = readJson(jobDataPath(workspace, jobId));
-    console.log(data?.rendered ?? st.result ?? "(task completed with no output)");
+    // `??` alone would print a bare EMPTY string as the whole result; trim-check
+    // instead (but never `||` — a legitimate answer like "0" is falsy).
+    const out = data?.rendered ?? st.result ?? "";
+    console.log(String(out).trim() ? out : "(task completed with no output)");
     printTrailer(data?.usage, {
       requestedModel: data?.requestedModel ?? st.requestedModel,
       sessionId: data?.opencodeSessionId ?? st.opencodeSessionId,
@@ -1600,6 +1615,7 @@ async function handleTaskWorker(argv) {
         // honestly. dispatchWithRetry owns the token heartbeat + stall watchdog,
         // and onSession keeps the job's opencodeSessionId pointed at the live
         // session across retries.
+        const dispatchedAt = Date.now(); // usage window: this run's turns only (a RESUMED session carries the previous task's turns)
         const dispatch = await dispatchWithRetry({
           client, prompt, agent: agentName, model: options.model,
           extract: extractResponseText, log, resumeSessionId,
@@ -1612,7 +1628,7 @@ async function handleTaskWorker(argv) {
         if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
 
         const text = extractResponseText(response);
-        const usage = await client.getSessionUsage(sessionId).catch(() => null);
+        const usage = await client.getSessionUsage(sessionId, { since: dispatchedAt }).catch(() => null);
         report("finalizing", "Done");
 
         return { rendered: text, usage, requestedModel: options.model, summary: text.slice(0, 500), opencodeSessionId: sessionId };
@@ -2406,7 +2422,7 @@ async function handleCancel(argv) {
  * @param {any} response
  * @returns {string}
  */
-function extractResponseText(response) {
+export function extractResponseText(response) {
   if (response == null) return "";
   if (typeof response === "string") return response;
 
@@ -2433,7 +2449,11 @@ function extractResponseText(response) {
     }
   }
 
-  return JSON.stringify(response, null, 2);
+  // UNKNOWN shape: return empty so the dispatch layer treats it as a failed
+  // turn (provider-error probe + honest error) instead of a "success" whose
+  // answer is a raw JSON dump. Stringifying here made any unrecognized
+  // response body pass the emptiness check and print as the result.
+  return "";
 }
 
 /**

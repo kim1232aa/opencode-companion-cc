@@ -30,9 +30,12 @@ Execution mode:
 
 - Default (or `--wait`): `wait-and-result` — BLOCKS until OpenCode finishes and
   prints the full output. Run it in the foreground with `timeout: 600000` (the
-  Bash maximum). If the call is cut off, the detached worker is still alive: take
-  the job id from the `[opencode] job <id> dispatched…` stderr line and poll
-  `result <id>` until it returns. Never say "I'll check back later".
+  Bash maximum). If the call is CUT OFF WITHOUT A SIGNAL (Claude Code moves a
+  timed-out Bash to the background), the worker is still alive: take the job id
+  from the `[opencode] job <id> dispatched…` stderr line and poll `result <id>`.
+  But a SIGTERM/SIGINT (user `x`/Ctrl-C, or a harness that signals on timeout)
+  CANCELS the job — by design. For a task likely to exceed 10 minutes, prefer
+  `task --background` + polling `result <id>`. Never say "I'll check back later".
 - `--background`: `task --background` — returns a job id immediately without
   blocking; the user retrieves the output later with `/opencode:result`. This is
   also how you fan out: N independent tasks → N `task --background` calls (or the
