@@ -4,7 +4,7 @@ import {
   sortJobsNewestFirst,
   matchJobReference,
   resolveResultJob,
-  resolveCancelableJob,
+  resolveCancelableJobs,
   buildStatusSnapshot,
 } from "../plugins/opencode/scripts/lib/job-control.mjs";
 
@@ -56,15 +56,17 @@ describe("job-control", () => {
     assert.equal(job.id, "task-ghi");
   });
 
-  it("resolveCancelableJob returns running job", () => {
-    const { job } = resolveCancelableJob(jobs);
-    assert.equal(job.id, "task-def");
+  // (the dead singular resolveCancelableJob was removed; the plural is the one
+  // both frontends actually use)
+  it("resolveCancelableJobs returns running jobs", () => {
+    const { jobs: cancelable } = resolveCancelableJobs(jobs);
+    assert.ok(cancelable.some((j) => j.id === "task-def"));
   });
 
-  it("resolveCancelableJob returns null when no running jobs", () => {
+  it("resolveCancelableJobs returns none when no running jobs", () => {
     const noRunning = jobs.filter((j) => j.status !== "running");
-    const { job } = resolveCancelableJob(noRunning);
-    assert.equal(job, null);
+    const { jobs: cancelable } = resolveCancelableJobs(noRunning);
+    assert.equal(cancelable.length, 0);
   });
 
   it("buildStatusSnapshot separates running and finished", () => {

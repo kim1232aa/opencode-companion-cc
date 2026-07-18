@@ -5,34 +5,34 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { extractTaskText } from "../plugins/opencode/scripts/lib/args.mjs";
+import { parseTaskArgv } from "../plugins/opencode/scripts/lib/args.mjs";
 import { assertSafeRef, getDiff } from "../plugins/opencode/scripts/lib/git.mjs";
 import { resolveResultJob } from "../plugins/opencode/scripts/lib/job-control.mjs";
 import { runCommand } from "../plugins/opencode/scripts/lib/process.mjs";
 import { withWorktree } from "../plugins/opencode/scripts/lib/worktree.mjs";
 
-describe("extractTaskText — unknown flags are task text, not routing flags", () => {
+// (extractTaskText was removed; the byte-for-byte forwarding promise now lives
+// in parseTaskArgv, asserted against the successor.)
+describe("parseTaskArgv — unknown flags are task text, not routing flags", () => {
   it("keeps an unknown --flag inside the task text (byte-for-byte promise)", () => {
-    const text = extractTaskText(
+    const { taskText } = parseTaskArgv(
       ["--model", "p/m", "run", "git", "commit", "--no-verify", "now"],
-      ["model"],
-      ["write"]
+      { valueOptions: ["model"], booleanOptions: ["write"] }
     );
-    assert.equal(text, "run git commit --no-verify now");
+    assert.equal(taskText, "run git commit --no-verify now");
   });
 
   it("still strips declared flags (value + boolean + inline forms)", () => {
-    const text = extractTaskText(
+    const { taskText } = parseTaskArgv(
       ["--write", "--model=p/m", "fix", "the", "bug"],
-      ["model"],
-      ["write"]
+      { valueOptions: ["model"], booleanOptions: ["write"] }
     );
-    assert.equal(text, "fix the bug");
+    assert.equal(taskText, "fix the bug");
   });
 
   it("keeps an unknown --foo=bar inline token as task text", () => {
-    const text = extractTaskText(["use", "--depth=3", "here"], ["model"], []);
-    assert.equal(text, "use --depth=3 here");
+    const { taskText } = parseTaskArgv(["use", "--depth=3", "here"], { valueOptions: ["model"] });
+    assert.equal(taskText, "use --depth=3 here");
   });
 });
 

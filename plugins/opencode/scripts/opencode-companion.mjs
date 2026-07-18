@@ -659,8 +659,34 @@ async function handleReview(argv) {
   // --background at the CLI: detach and return (no-op inside the detached child).
   if (detachReviewIfBackground(options, "review")) return;
 
+  await runReviewJob({
+    type: "review",
+    label: "review",
+    errorLabel: "Review",
+    sessionTitle: "Code Review",
+    adversarial: false,
+    base: options.base,
+    model: options.model,
+    budget,
+  });
+}
+
+/**
+ * The ONE review dispatch body, shared by `review` and `adversarial-review` —
+ * they used to be ~75 duplicated lines that had already begun to drift. Mirrors
+ * the Codex frontend's runReview. Foreground-blocking; installs the x/Ctrl-C
+ * cancel handler; exits the process on failure (CLI semantics).
+ */
+async function runReviewJob({ type, label, errorLabel, sessionTitle, adversarial, base, model, focus, budget }) {
   const workspace = await resolveWorkspace();
-  const job = createJobRecord(workspace, "review", { base: options.base, model: options.model });
+  const job = createJobRecord(workspace, type, {
+    base,
+    model,
+    // Adversarial only: record the focus, and surface it in `status`/`watch` via
+    // the preview field DIRECTLY (a review runs foreground and has no worker, so
+    // a taskText would only write an inert `.request.json` nothing reads).
+    ...(adversarial ? { focus, ...(focus ? { taskPreview: taskPreview(focus) } : {}) } : {}),
+  });
 
   // Foreground blocking: `x`/Ctrl-C must abort the OpenCode session it drives.
   const uninstall = installForegroundCancelHandler(workspace, () => [job.id]);
@@ -670,21 +696,22 @@ async function handleReview(argv) {
       const client = await connect({ cwd: workspace });
 
       const prompt = await buildReviewPrompt(workspace, {
-        base: options.base,
-        adversarial: false,
+        base,
+        adversarial,
+        focus,
         brief: budget.brief,
         maxWords: budget.maxWords,
       }, PLUGIN_ROOT);
 
-      report("reviewing", "Running review...");
-      log(`Prompt length: ${prompt.length} chars${options.model ? `, model: ${options.model}` : ""}`);
+      report("reviewing", `Running ${label}...`);
+      log(`Prompt length: ${prompt.length} chars${adversarial ? `, focus: ${focus || "(none)"}` : ""}${model ? `, model: ${model}` : ""}`);
 
       // Retry a transient 500 / hang on a fresh session; an empty (deterministic)
       // turn fails honestly. dispatchWithRetry owns the heartbeat + stall watchdog.
       const dispatch = await dispatchWithRetry({
-        client, prompt, agent: "plan", model: options.model, // read-only agent for reviews
+        client, prompt, agent: "plan", model, // read-only agent for reviews
         extract: extractResponseText, log,
-        makeSession: () => client.createSession({ title: `Code Review ${job.id}` }),
+        makeSession: () => client.createSession({ title: `${sessionTitle} ${job.id}` }),
         onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
         shouldStop: () => isJobCanceled(workspace, job.id),
       });
@@ -696,7 +723,7 @@ async function handleReview(argv) {
 
       // Try to parse structured output
       const text = extractResponseText(response);
-      let structured = tryParseJson(text);
+      const structured = tryParseJson(text);
       const usage = await client.getSessionUsage(sessionId).catch(() => null);
 
       return {
@@ -709,9 +736,9 @@ async function handleReview(argv) {
     });
 
     console.log(result.rendered);
-    printTrailer(result.usage, { requestedModel: options.model, sessionId: result.opencodeSessionId });
+    printTrailer(result.usage, { requestedModel: model, sessionId: result.opencodeSessionId });
   } catch (err) {
-    console.error(`Review failed: ${err.message}`);
+    console.error(`${errorLabel} failed: ${err.message}`);
     process.exit(1);
   } finally {
     uninstall();
@@ -741,69 +768,17 @@ async function handleAdversarialReview(argv) {
   // --background at the CLI: detach and return (no-op inside the detached child).
   if (detachReviewIfBackground(options, "adversarial review")) return;
 
-  const workspace = await resolveWorkspace();
-  const job = createJobRecord(workspace, "adversarial-review", {
+  await runReviewJob({
+    type: "adversarial-review",
+    label: "adversarial review",
+    errorLabel: "Adversarial review",
+    sessionTitle: "Adversarial Review",
+    adversarial: true,
     base: options.base,
-    focus,
     model: options.model,
-    // Surface the focus in `status`/`watch`. Set the preview field DIRECTLY
-    // rather than passing taskText: a review runs foreground and has no worker,
-    // so a taskText would only write an inert `.request.json` nothing reads.
-    ...(focus ? { taskPreview: taskPreview(focus) } : {}),
+    focus,
+    budget,
   });
-
-  // Foreground blocking: `x`/Ctrl-C must abort the OpenCode session it drives.
-  const uninstall = installForegroundCancelHandler(workspace, () => [job.id]);
-  try {
-    const result = await runTrackedJob(workspace, job, async ({ report, log }) => {
-      report("starting", "Connecting to OpenCode server...");
-      const client = await connect({ cwd: workspace });
-
-      const prompt = await buildReviewPrompt(workspace, {
-        base: options.base,
-        adversarial: true,
-        focus,
-        brief: budget.brief,
-        maxWords: budget.maxWords,
-      }, PLUGIN_ROOT);
-
-      report("reviewing", "Running adversarial review...");
-      log(`Prompt length: ${prompt.length} chars, focus: ${focus || "(none)"}${options.model ? `, model: ${options.model}` : ""}`);
-
-      const dispatch = await dispatchWithRetry({
-        client, prompt, agent: "plan", model: options.model,
-        extract: extractResponseText, log,
-        makeSession: () => client.createSession({ title: `Adversarial Review ${job.id}` }),
-        onSession: (sid) => upsertJob(workspace, { id: job.id, opencodeSessionId: sid }),
-        shouldStop: () => isJobCanceled(workspace, job.id),
-      });
-      const response = dispatch.response;
-      const sessionId = dispatch.sessionId;
-      if (dispatch.attempts > 1) log(`Succeeded on attempt ${dispatch.attempts}.`);
-
-      report("finalizing", "Processing review output...");
-
-      const text = extractResponseText(response);
-      let structured = tryParseJson(text);
-      const usage = await client.getSessionUsage(sessionId).catch(() => null);
-
-      return {
-        rendered: structured ? renderReview(structured) : text,
-        raw: response,
-        structured,
-        usage,
-        opencodeSessionId: sessionId,
-      };
-    });
-
-    console.log(result.rendered);
-    printTrailer(result.usage, { requestedModel: options.model, sessionId: result.opencodeSessionId });
-  } catch (err) {
-    console.error(`Adversarial review failed: ${err.message}`);
-    process.exit(1);
-  } finally {
-    uninstall();
-  }
 }
 
 // ------------------------------------------------------------------
@@ -830,19 +805,11 @@ async function handleTask(argv) {
   const isWrite = agentName !== "plan";
   const useWorktree = !!options.worktree;
 
-  // Check for resume
+  // Check for resume — same selector as task-resume-candidate (status-filtered),
+  // so --resume-last never resumes a failed/canceled job's session.
   let resumeSessionId = null;
   if (options["resume-last"] && !options.fresh) { // --fresh explicitly overrides --resume-last
-    const state = loadState(workspace);
-    const sessionId = getClaudeSessionId();
-    const lastTask = state.jobs
-      ?.filter((j) => j.type === "task" && j.opencodeSessionId)
-      ?.filter((j) => !sessionId || j.sessionId === sessionId)
-      ?.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))?.[0];
-
-    if (lastTask?.opencodeSessionId) {
-      resumeSessionId = lastTask.opencodeSessionId;
-    }
+    resumeSessionId = pickResumeCandidate(loadState(workspace).jobs, getClaudeSessionId()).opencodeSessionId;
   }
 
   const { brief, maxWords } = resolveOutputBudget(options);
@@ -1383,13 +1350,7 @@ async function handleWaitAndResult(argv) {
 
   let resumeSessionId = null;
   if (options["resume-last"] && !options.fresh) { // --fresh explicitly overrides --resume-last
-    const state = loadState(workspace);
-    const sid = getClaudeSessionId();
-    const lastTask = state.jobs
-      ?.filter((j) => j.type === "task" && j.opencodeSessionId)
-      ?.filter((j) => !sid || j.sessionId === sid)
-      ?.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))?.[0];
-    if (lastTask?.opencodeSessionId) resumeSessionId = lastTask.opencodeSessionId;
+    resumeSessionId = pickResumeCandidate(loadState(workspace).jobs, getClaudeSessionId()).opencodeSessionId;
   }
 
   const { brief, maxWords } = resolveOutputBudget(options);
@@ -1662,24 +1623,32 @@ async function handleTaskWorker(argv) {
   }
 }
 
+// Pick the most recent RESUMABLE task session: completed/running only. This is
+// THE resume selector — `task --resume-last`, `wait-and-result --resume-last`
+// and `task-resume-candidate` all go through it. It used to be copy-pasted
+// three times, and only this one filtered by status — so `--resume-last` could
+// resume the session of a FAILED/CANCELED job that the candidate command would
+// never have offered. Mirrors the Codex frontend's pickResumeCandidate.
+export function pickResumeCandidate(jobs, sessionId) {
+  const lastTask = (jobs ?? [])
+    .filter((j) => j && j.type === "task" && j.opencodeSessionId)
+    .filter((j) => j.status === "completed" || j.status === "running")
+    .filter((j) => !sessionId || j.sessionId === sessionId)
+    .sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))[0];
+  return {
+    available: !!lastTask,
+    jobId: lastTask?.id ?? null,
+    opencodeSessionId: lastTask?.opencodeSessionId ?? null,
+  };
+}
+
 async function handleTaskResumeCandidate(argv) {
   const { options } = parseArgs(argv, { booleanOptions: ["json"] });
 
   const workspace = await resolveWorkspace();
   const state = loadState(workspace);
   const sessionId = getClaudeSessionId();
-
-  const lastTask = state.jobs
-    ?.filter((j) => j.type === "task" && j.opencodeSessionId)
-    ?.filter((j) => j.status === "completed" || j.status === "running")
-    ?.filter((j) => !sessionId || j.sessionId === sessionId)
-    ?.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0))?.[0];
-
-  const result = {
-    available: !!lastTask,
-    jobId: lastTask?.id ?? null,
-    opencodeSessionId: lastTask?.opencodeSessionId ?? null,
-  };
+  const result = pickResumeCandidate(state.jobs, sessionId);
 
   if (options.json) {
     console.log(JSON.stringify(result));

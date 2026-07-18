@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { parseArgs, extractTaskText } from "../plugins/opencode/scripts/lib/args.mjs";
+import { parseArgs, parseTaskArgv } from "../plugins/opencode/scripts/lib/args.mjs";
 import { withFileLock, pidStartTime } from "../plugins/opencode/scripts/lib/fs.mjs";
 import { runCommand } from "../plugins/opencode/scripts/lib/process.mjs";
 
@@ -30,9 +30,15 @@ describe("parseArgs — value option must not swallow a following flag", () => {
     assert.equal(options.model, "prov/mod");
   });
 
-  it("extractTaskText mirrors the rule (does not fold --write into task text)", () => {
-    const text = extractTaskText(["--model", "--write", "do", "the", "thing"], ["model"], ["write"]);
-    assert.equal(text, "do the thing");
+  it("parseTaskArgv enforces the rule harder: `--model --write` is a fatal missing value", () => {
+    // (extractTaskText was removed; its successor refuses to guess.)
+    const { options, taskText, errors } = parseTaskArgv(["--model", "--write", "do", "the", "thing"], {
+      valueOptions: ["model"],
+      booleanOptions: ["write"],
+    });
+    assert.ok(errors.some((e) => /--model expects a value/.test(e)));
+    assert.equal(options.write, true, "--write must survive");
+    assert.equal(taskText, "do the thing");
   });
 });
 

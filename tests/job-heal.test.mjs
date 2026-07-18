@@ -7,7 +7,7 @@ import path from "node:path";
 import {
   reconcileStrandedJobs,
   resolveResultJob,
-  resolveCancelableJob,
+  resolveCancelableJobs,
   buildStatusSnapshot,
 } from "../plugins/opencode/scripts/lib/job-control.mjs";
 import { upsertJob, loadState } from "../plugins/opencode/scripts/lib/state.mjs";
@@ -80,7 +80,8 @@ describe("resolveResultJob / resolveCancelableJob session scoping", () => {
   });
 
   it("cancel without ref scopes to the session", () => {
-    assert.equal(resolveCancelableJob(jobs, undefined, { sessionId: "S1" }).job.id, "c");
+    const { jobs: cancelable } = resolveCancelableJobs(jobs, undefined, { sessionId: "S1" });
+    assert.deepEqual(cancelable.map((j) => j.id), ["c"]);
   });
 
   it("canceled status counts as a resolvable result", () => {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, extractTaskText } from "../plugins/opencode/scripts/lib/args.mjs";
+import { parseArgs, parseTaskArgv } from "../plugins/opencode/scripts/lib/args.mjs";
 
 describe("parseArgs", () => {
   it("parses value options", () => {
@@ -37,18 +37,18 @@ describe("parseArgs", () => {
   });
 });
 
-describe("extractTaskText", () => {
+// (extractTaskText was removed; parseTaskArgv owns text extraction now.)
+describe("parseTaskArgv — strips declared flags, returns text", () => {
   it("strips flags and returns text", () => {
-    const text = extractTaskText(
+    const { taskText } = parseTaskArgv(
       ["fix", "--model", "claude", "--write", "the", "bug"],
-      ["model"],
-      ["write"]
+      { valueOptions: ["model"], booleanOptions: ["write"] }
     );
-    assert.equal(text, "fix the bug");
+    assert.equal(taskText, "fix the bug");
   });
 
   it("returns empty for flags-only input", () => {
-    const text = extractTaskText(["--wait", "--model", "gpt"], ["model"], ["wait"]);
-    assert.equal(text, "");
+    const { taskText } = parseTaskArgv(["--wait", "--model", "gpt"], { valueOptions: ["model"], booleanOptions: ["wait"] });
+    assert.equal(taskText, "");
   });
 });

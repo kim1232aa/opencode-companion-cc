@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseArgs, parseTaskArgv, extractTaskText } from "../plugins/opencode/scripts/lib/args.mjs";
+import { parseArgs, parseTaskArgv } from "../plugins/opencode/scripts/lib/args.mjs";
 
 describe("parseArgs — harvested fixes", () => {
   it("supports --key=value form", () => {
@@ -95,19 +95,23 @@ describe("parseArgs — more harvested fixes", () => {
   });
 });
 
-describe("extractTaskText — harvested fixes", () => {
+// extractTaskText was removed (dead export superseded by parseTaskArgv); its
+// harvested-fix semantics live on here against the successor.
+describe("parseTaskArgv — text extraction semantics (ex-extractTaskText)", () => {
   it("consumes --key value and returns the remaining task text", () => {
-    const text = extractTaskText(["--model", "x/y", "do", "the", "thing"], ["model"], []);
-    assert.equal(text, "do the thing");
+    const { options, taskText } = parseTaskArgv(["--model", "x/y", "do", "the", "thing"], { valueOptions: ["model"] });
+    assert.equal(options.model, "x/y");
+    assert.equal(taskText, "do the thing");
   });
 
   it("does not consume a following token for --key=value", () => {
-    const text = extractTaskText(["--model=x/y", "do", "it"], ["model"], []);
-    assert.equal(text, "do it");
+    const { options, taskText } = parseTaskArgv(["--model=x/y", "do", "it"], { valueOptions: ["model"] });
+    assert.equal(options.model, "x/y");
+    assert.equal(taskText, "do it");
   });
 
   it("keeps text after the -- sentinel", () => {
-    const text = extractTaskText(["--agent", "plan", "--", "--weird", "task"], ["agent"], []);
-    assert.equal(text, "--weird task");
+    const { taskText } = parseTaskArgv(["--agent", "plan", "--", "--weird", "task"], { valueOptions: ["agent"] });
+    assert.equal(taskText, "--weird task");
   });
 });

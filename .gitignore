@@ -1,3 +1,5 @@
 node_modules/
 *.log
 .DS_Store
+# oh-my-openagent runtime state left by OpenCode delegations run in this repo
+.omo/
