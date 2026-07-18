@@ -1,6 +1,6 @@
 {
   "name": "opencode-companion-cc",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "private": true,
   "type": "module",
   "description": "Maintained, hardened OpenCode delegation + review plugin for Claude Code.",

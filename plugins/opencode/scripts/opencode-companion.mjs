@@ -1907,8 +1907,15 @@ export function collectAggregateStatus(opts = {}) {
     ? opts.only
     : `all workspaces · ${repos} repo${repos === 1 ? "" : "s"}`;
 
+  // Surface corrupt state dirs instead of silently hiding those repos: the
+  // `corrupt` flag was computed by listWorkspaceStates but never shown, so a
+  // torn state.json made a repo's jobs vanish from the board with no hint.
+  const corrupt = (opts.only ? groups.filter((g) => g.workspace === opts.only || g.hash === onlyHash) : groups)
+    .filter((g) => g.corrupt)
+    .map((g) => labels.get(g.hash) ?? `#${g.hash.slice(0, 8)}`);
+
   return {
-    text: renderAggregateStatus({ running, recent: finished.slice(0, 8) }),
+    text: renderAggregateStatus({ running, recent: finished.slice(0, 8), corrupt }),
     running: running.length,
     scope,
   };
@@ -1919,7 +1926,7 @@ export function collectAggregateStatus(opts = {}) {
  * same log parsing — liveSignal/recentActivity are imported, not re-implemented),
  * plus a `[repo]` tag on every row, which is the entire point of this view.
  *
- * @param {{ running: object[], recent: object[] }} snapshot
+ * @param {{ running: object[], recent: object[], corrupt?: string[] }} snapshot
  * @returns {string}
  */
 export function renderAggregateStatus(snapshot) {
@@ -1968,7 +1975,14 @@ export function renderAggregateStatus(snapshot) {
     lines.push("");
   }
 
-  if (!running.length && !recent.length) {
+  const corrupt = snapshot.corrupt ?? [];
+  if (corrupt.length) {
+    lines.push(`## ⚠️ Unreadable state (${corrupt.length})\n`);
+    lines.push(`- state.json is corrupt (torn write?) in: ${corrupt.join(", ")} — that repo's jobs are hidden from this board until it heals or is removed.`);
+    lines.push("");
+  }
+
+  if (!running.length && !recent.length && !corrupt.length) {
     lines.push("No jobs in any workspace yet.");
     lines.push("");
   }

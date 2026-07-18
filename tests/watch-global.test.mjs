@@ -102,6 +102,20 @@ describe("listWorkspaceStates", () => {
     assert.equal(empty.corrupt, false, "a missing state.json is NOT corruption");
     assert.deepEqual(empty.jobs, []);
   });
+
+  it("a corrupt workspace is SHOWN on the board, not silently hidden", () => {
+    // The corrupt flag used to be computed and never consumed — a torn
+    // state.json made a repo's jobs vanish from the watch panel with no hint.
+    seed("/repos/healthy", [{ id: "task-h-1", type: "task", status: "running" }]);
+    const bad = stateRoot("/repos/broken");
+    fs.mkdirSync(bad, { recursive: true });
+    fs.writeFileSync(path.join(bad, "state.json"), '{"jobs": [{"id": "torn');
+    fs.writeFileSync(path.join(bad, "workspace.json"), JSON.stringify({ workspace: "/repos/broken" }));
+
+    const snap = collectAggregateStatus({ base: base() });
+    assert.match(snap.text, /Unreadable state/, "the board must call out the corrupt repo");
+    assert.match(snap.text, /broken/, "…by name");
+  });
 });
 
 describe("labelWorkspaces", () => {

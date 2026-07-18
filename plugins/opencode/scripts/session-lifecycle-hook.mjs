@@ -42,7 +42,10 @@ async function main() {
   }
 }
 
-main().catch(() => {
-  // Hooks should never block the session, so swallow errors silently.
+main().catch((err) => {
+  // Hooks must never block the session — always exit 0 — but a swallowed
+  // TypeError is a swallowed bug: leave the reason on stderr (visible in
+  // `claude --debug`) before exiting.
+  try { process.stderr.write(`[opencode session hook] ${err?.stack || err}\n`); } catch { /* broken stderr */ }
   process.exit(0);
 });
