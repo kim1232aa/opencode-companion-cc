@@ -215,13 +215,13 @@ buy nothing over four `Bash` calls.
 | `OPENCODE_SERVER_PORT` | `4096` | Port of the managed `opencode serve` daemon (dispatch, recovery, and cancel all agree on it). |
 | `OPENCODE_COMPANION_PROMPT_TIMEOUT_MS` | 30 min | Hard wall-clock cap on a single prompt turn. |
 | `OPENCODE_COMPANION_WAIT_TIMEOUT_MS` | 35 min | How long `wait-and-result` waits before giving up (the job keeps running). |
-| `OPENCODE_COMPANION_DATA` | tmpdir | Override the job-state directory (also how two frontends can share one store). |
+| `OPENCODE_COMPANION_DATA` | plugin data dir | Override the job-state directory (also how two frontends can share one store). Normal installs store state under the plugin's own data dir; tmpdir is only the last-resort fallback for source checkouts. |
 | `OPENCODE_COMPANION_VERBOSE_TRAILER` | off | `1` restores the multi-line token breakdown instead of the one-line trailer. |
 | `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | unset | Basic auth for the loopback server (loopback HTTP — see KNOWN_ISSUES). |
 
-**Review gate:** `/opencode:setup --enable-review-gate` installs a Stop hook that
-runs a targeted OpenCode review on Claude's response and blocks the stop if
-issues are found. **Off by default** — it can loop long and drain usage limits.
+**Review gate:** `/opencode:setup --enable-review-gate` turns on the (always
+installed, default-pass) Stop hook so it runs a targeted OpenCode review on
+Claude's response and blocks the stop if issues are found. **Off by default** — it can loop long and drain usage limits.
 
 ## FAQ
 
