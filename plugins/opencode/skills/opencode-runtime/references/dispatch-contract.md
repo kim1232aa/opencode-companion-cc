@@ -47,6 +47,10 @@ nothing over four Bash calls.
 - **Never** run the dispatch with `run_in_background`, and **never** answer with
   "I'll wait for the result" / "I'll check back later". Either return the
   blocking call's stdout, or actively fetch it with `result <id>`.
+  (Why: a subagent's turn ends with its report — a background shell's completion
+  notification has nowhere to land. The notify-on-completion recipe —
+  `wait-and-result <id>` in a tracked background shell — is for the MAIN loop
+  only, where the harness can actually wake the conversation.)
 
 ## Flag semantics
 

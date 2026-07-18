@@ -17,6 +17,7 @@ OpenCode CLI strings.
 | main loop → `task --background "<task>"`, later `result <id>` | **≈200** | **Default.** Job id returns instantly; the main loop never blocks. |
 | main loop → N × `task --background` in one turn (or `batch`, if present — see `--help`) | ≈200 × N | Parallel fan-out. |
 | main loop → `wait-and-result "<task>"` (foreground Bash, `timeout: 600000`) | ≈200 + result | You want the answer in this turn. |
+| main loop → `task --background`, then `wait-and-result <id>` in a **background** Bash (`run_in_background: true`) | ≈200 + result on wake | **Notify-on-completion.** The harness pings you when the tracked shell exits (= when the job finishes), so you keep working meanwhile. This is the ONLY wake-up mechanism: bare `task --background` never calls back (the worker is detached; no completion hook exists). |
 | `Task(opencode:opencode-rescue)` subagent | **≈10,000 fixed** | Only when the delegation needs multi-step reasoning (probe → decide → re-dispatch), or a very long result must be summarized before entering the main context. |
 
 The ~10k is paid before any useful work happens. Four rescue subagents that each wrap

@@ -875,7 +875,9 @@ async function handleTask(argv) {
     }
     upsertJob(workspace, { id: job.id, pid: bgChild.pid, pidStart: pidStartTime(bgChild.pid), detachedWorker: true });
     console.log(`OpenCode task started in background: ${job.id}`);
-    console.log("Check `/opencode:status` for progress.");
+    // There is NO completion callback on this path (the worker is detached; the
+    // plugin has no background-completion hook) — say how to actually get woken.
+    console.log(`Check \`/opencode:status\` for progress. To be NOTIFIED on completion instead of polling, run \`wait-and-result ${job.id}\` in a tracked background shell (run_in_background) — it exits when the job finishes.`);
     return;
   }
 
